@@ -1,112 +1,5 @@
-// F1 Stream Player v7 — Parallel Pre-fetch Fragment Loader
-// Fixed: Custom fLoader to parallelize segment downloads for slow connections
-
-class PrefetchLoader extends Hls.DefaultConfig.loader {
-  constructor(config) {
-    super(config);
-    if (!window.prefetchCache) {
-      window.prefetchCache = new Map();
-      window.activePrefetches = new Set();
-    }
-  }
-
-  load(context, config, callbacks) {
-    const url = context.url;
-    
-    // If it's not a media segment (e.g. manifest/playlist), use default loader
-    if (!url.includes('.html') && !url.includes('.ts')) {
-      super.load(context, config, callbacks);
-      return;
-    }
-
-    // Check if we have this segment pre-fetched in cache
-    if (window.prefetchCache.has(url)) {
-      const data = window.prefetchCache.get(url);
-      window.prefetchCache.delete(url); // consume once
-      
-      const stats = {
-        trequest: performance.now() - 10,
-        tfirst: performance.now() - 5,
-        tload: performance.now(),
-        loaded: data.byteLength,
-        total: data.byteLength
-      };
-      
-      callbacks.onSuccess({ data }, stats, context);
-      
-      // Trigger pre-fetch for next segments
-      this.triggerPrefetchOfNextSegments(context);
-      return;
-    }
-
-    // Fallback: load normally but also trigger prefetch for next ones
-    const originalSuccess = callbacks.onSuccess;
-    callbacks.onSuccess = (response, stats, context) => {
-      originalSuccess(response, stats, context);
-      this.triggerPrefetchOfNextSegments(context);
-    };
-
-    super.load(context, config, callbacks);
-  }
-
-  triggerPrefetchOfNextSegments(context) {
-    try {
-      const details = window.player?.hls?.levels?.[window.player?.hls?.currentLevel]?.details;
-      if (!details || !details.fragments) return;
-
-      const frags = details.fragments;
-      const currentSn = context.frag?.sn;
-      if (typeof currentSn !== 'number') return;
-
-      // Prefetch up to 3 next segments
-      const prefetchCount = 3;
-      for (let i = 1; i <= prefetchCount; i++) {
-        const nextFrag = frags.find(f => f.sn === currentSn + i);
-        if (nextFrag && nextFrag.url) {
-          this.prefetch(nextFrag.url);
-        }
-      }
-    } catch (e) {
-      // quiet
-    }
-  }
-
-  async prefetch(url) {
-    if (window.prefetchCache.has(url) || window.activePrefetches.has(url)) {
-      return;
-    }
-
-    if (window.prefetchCache.size > 8) {
-      // Clear oldest to prevent leak
-      const firstKey = window.prefetchCache.keys().next().value;
-      window.prefetchCache.delete(firstKey);
-    }
-
-    window.activePrefetches.add(url);
-    
-    try {
-      let fetchUrl = url;
-      if (window.player?.useProxy && window.player?.PROXY_URL) {
-        fetchUrl = window.player.PROXY_URL + encodeURIComponent(url);
-      }
-
-      const res = await fetch(fetchUrl, {
-        headers: {
-          'Accept': '*/*',
-        }
-      });
-      
-      if (!res.ok) throw new Error('status ' + res.status);
-      
-      const buffer = await res.arrayBuffer();
-      window.prefetchCache.set(url, buffer);
-    } catch (e) {
-      // quiet fail
-    } finally {
-      window.activePrefetches.delete(url);
-    }
-  }
-}
+// F1 Stream Player v8 — Silent Browser-Cache Prefetcher
+// Fixed: Zero-risk cache pre-fetching using standard browser cache
 
 class StreamPlayer {
   constructor() {
@@ -123,6 +16,7 @@ class StreamPlayer {
     this.isRecovering = false;
     this.videoEventListeners = [];
     this.bufferWatchdog = null;
+    this.prefetchedUrls = new Set();
     
     // Log filtering
     this.logFilters = {
@@ -364,6 +258,37 @@ class StreamPlayer {
     }, 3000);
   }
 
+  // Prefetch helper using standard browser fetch (hits memory/disk cache)
+  async prefetchSegment(url) {
+    if (this.prefetchedUrls.has(url)) return;
+    this.prefetchedUrls.add(url);
+
+    // Limit cache history size
+    if (this.prefetchedUrls.size > 20) {
+      const firstVal = this.prefetchedUrls.values().next().value;
+      this.prefetchedUrls.delete(firstVal);
+    }
+
+    try {
+      let fetchUrl = url;
+      if (this.useProxy && this.PROXY_URL) {
+        fetchUrl = this.PROXY_URL + encodeURIComponent(url);
+      }
+
+      // Fetch silently with CORS + cache options
+      await fetch(fetchUrl, {
+        method: 'GET',
+        mode: 'cors',
+        credentials: 'omit',
+        headers: {
+          'Accept': '*/*'
+        }
+      });
+    } catch (e) {
+      // ignore
+    }
+  }
+
   load(rawUrl) {
     if (!rawUrl) {
       this.log('no URL provided', 'err');
@@ -377,6 +302,7 @@ class StreamPlayer {
     this.stallRecoveryAttempts = 0;
     this.lastStallTime = 0;
     this.isRecovering = false;
+    this.prefetchedUrls.clear();
     
     this.setStatus('loading', 'loading');
     this.showLoading('connecting to stream...');
@@ -391,35 +317,32 @@ class StreamPlayer {
         enableWorker: false,
         debug: false,
         
-        // Inject Custom Parallel Loader
-        fLoader: PrefetchLoader,
+        // Live stream config — stay further back for slow network
+        liveSyncDurationCount: 5,
+        liveMaxLatencyDurationCount: 15,
+        maxLiveSyncPlaybackRate: 0.95, // slow down playback slightly when lagging
         
-        // Live stream config
-        liveSyncDurationCount: 3,
-        liveMaxLatencyDurationCount: 10,
-        maxLiveSyncPlaybackRate: 1.1,
-        
-        // Buffer tuning
-        maxBufferLength: 15,
-        maxMaxBufferLength: 30,
+        // Buffer tuning — normal range since pre-fetch handles the speed
+        maxBufferLength: 20,
+        maxMaxBufferLength: 40,
         backBufferLength: 0,
         
         // Gap handling
-        maxBufferHole: 0.5,
+        maxBufferHole: 0.8,
         highBufferWatchdogPeriod: 2,
-        nudgeMaxRetry: 10,
+        nudgeMaxRetry: 15,
         
         // Network retry
         manifestLoadingTimeOut: 15000,
-        manifestLoadingMaxRetry: 4,
+        manifestLoadingMaxRetry: 5,
         manifestLoadingRetryDelay: 1000,
         
         levelLoadingTimeOut: 15000,
-        levelLoadingMaxRetry: 4,
+        levelLoadingMaxRetry: 5,
         levelLoadingRetryDelay: 1000,
         
         fragLoadingTimeOut: 30000,
-        fragLoadingMaxRetry: 6,
+        fragLoadingMaxRetry: 8,
         fragLoadingRetryDelay: 1000,
         fragLoadingMaxRetryTimeout: 64000,
         
@@ -446,10 +369,31 @@ class StreamPlayer {
           this.log('  level ' + idx + ': ' + res + ' @ ' + br, 'debug');
         });
         
-        // Auto-play setelah manifest parsed
         this.video.play().catch(e => {
           this.log('autoplay blocked: ' + e.message, 'warn');
         });
+      });
+
+      // === FRAG_CHANGED (Trigger Prefetch) ===
+      this.hls.on(Hls.Events.FRAG_CHANGED, (_, data) => {
+        try {
+          const details = this.hls?.levels?.[this.hls.currentLevel]?.details;
+          if (!details || !details.fragments) return;
+
+          const frags = details.fragments;
+          const currentSn = data.frag?.sn;
+          if (typeof currentSn !== 'number') return;
+
+          // Prefetch next 3 segments into browser cache
+          for (let i = 1; i <= 3; i++) {
+            const nextFrag = frags.find(f => f.sn === currentSn + i);
+            if (nextFrag && nextFrag.url) {
+              this.prefetchSegment(nextFrag.url);
+            }
+          }
+        } catch (e) {
+          this.log('prefetch error: ' + e.message, 'debug');
+        }
       });
 
       // === LEVEL LOADED ===
