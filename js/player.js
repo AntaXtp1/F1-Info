@@ -374,8 +374,23 @@ class StreamPlayer {
         });
       });
 
-      // === FRAG_CHANGED (Trigger Prefetch) ===
-      this.hls.on(Hls.Events.FRAG_CHANGED, (_, data) => {
+      // === LEVEL_LOADED (Initial Prefetch Burst) ===
+      this.hls.on(Hls.Events.LEVEL_LOADED, (_, data) => {
+        try {
+          const frags = data.details?.fragments;
+          if (!frags || frags.length === 0) return;
+
+          // Prefetch first 5 segments immediately before playback starts
+          const toPrefetch = frags.slice(0, 5);
+          toPrefetch.forEach(f => {
+            if (f.url) this.prefetchSegment(f.url);
+          });
+          this.log('pre-fetching ' + toPrefetch.length + ' initial segments', 'debug');
+        } catch (e) {}
+      });
+
+      // === FRAG_LOADED (Trigger Prefetch for next 4 segments) ===
+      this.hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
         try {
           const details = this.hls?.levels?.[this.hls.currentLevel]?.details;
           if (!details || !details.fragments) return;
@@ -384,12 +399,17 @@ class StreamPlayer {
           const currentSn = data.frag?.sn;
           if (typeof currentSn !== 'number') return;
 
-          // Prefetch next 3 segments into browser cache
-          for (let i = 1; i <= 3; i++) {
+          // Prefetch next 4 segments into browser cache
+          let prefCount = 0;
+          for (let i = 1; i <= 4; i++) {
             const nextFrag = frags.find(f => f.sn === currentSn + i);
             if (nextFrag && nextFrag.url) {
               this.prefetchSegment(nextFrag.url);
+              prefCount++;
             }
+          }
+          if (prefCount > 0) {
+            this.log('pre-fetched ' + prefCount + ' segments ahead of seg ' + currentSn, 'debug');
           }
         } catch (e) {
           this.log('prefetch error: ' + e.message, 'debug');
