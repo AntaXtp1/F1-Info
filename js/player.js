@@ -194,7 +194,11 @@ class StreamPlayer {
     
     const bufferedEnd = buffered.end(buffered.length - 1);
     const bufferedSec = bufferedEnd - this.video.currentTime;
-    const targetBuffer = 8;
+    
+    // Dynamic target buffer: 360p only needs 3s start buffer, 480p+ needs 10s startup buffer
+    const isLowRes = this.currentUrl.includes('/3/');
+    const targetBuffer = isLowRes ? 3 : 10;
+    
     const progress = Math.min(95, 30 + (bufferedSec / targetBuffer) * 65);
     
     if (bufferedSec < 0) {
@@ -205,7 +209,7 @@ class StreamPlayer {
     }
     
     this.updateLoadingProgress(progress);
-    this.loadingText.textContent = 'buffering... ' + bufferedSec.toFixed(1) + 's';
+    this.loadingText.textContent = 'buffering... ' + bufferedSec.toFixed(1) + 's / ' + targetBuffer + 's';
     
     if (bufferedSec >= targetBuffer) {
       this.hideLoading();
@@ -329,22 +333,31 @@ class StreamPlayer {
     this.log('connecting: ' + rawUrl, 'info');
     if (this.useProxy) this.log('via proxy: ' + this.PROXY_URL.split('?')[0], 'info');
 
-    // Cleanup
+    // Cleanup prior HLS instance
     this.cleanup();
+
+    // DYNAMIC CONFIG BASED ON RESOLUTION:
+    // If it's 360p (level 3), use low latency. 
+    // If it's 480p (level 2) or higher, use a larger live sync buffer to build a bigger "grey bar" (buffered range)
+    const isLowRes = rawUrl.includes('/3/');
+    const liveSyncCount = isLowRes ? 3 : 7; // 3 segments for 360p (~6s latency), 7 segments for 480p+ (~14s buffer zone)
+    const maxBufLength = isLowRes ? 15 : 45; // smaller target for 360p, larger for 480p+
+    
+    this.log('dynamic sync: ' + liveSyncCount + ' segments delay, max buffer ' + maxBufLength + 's', 'info');
 
     if (Hls.isSupported()) {
       this.hls = new Hls({
         enableWorker: false,
         debug: false,
         
-        // Live stream config — stay further back for slow network
-        liveSyncDurationCount: 5,
-        liveMaxLatencyDurationCount: 15,
-        maxLiveSyncPlaybackRate: 0.95, // slow down playback slightly when lagging
+        // Live stream config — dynamic based on quality to sustain the "grey bar"
+        liveSyncDurationCount: liveSyncCount,
+        liveMaxLatencyDurationCount: liveSyncCount * 3,
+        maxLiveSyncPlaybackRate: isLowRes ? 1.0 : 0.95, // scale playback speed on high res
         
-        // Buffer tuning — normal range since pre-fetch handles the speed
-        maxBufferLength: 20,
-        maxMaxBufferLength: 40,
+        // Buffer tuning
+        maxBufferLength: maxBufLength,
+        maxMaxBufferLength: maxBufLength * 2,
         backBufferLength: 0,
         
         // Gap handling
@@ -366,7 +379,7 @@ class StreamPlayer {
         fragLoadingRetryDelay: 1000,
         fragLoadingMaxRetryTimeout: 64000,
         
-        // ABR — force to lowest level (360p) on start, let it adapt up if speed allows
+        // ABR
         startLevel: 0,
         capLevelToPlayerSize: false,
         
