@@ -18,7 +18,7 @@
       <div class="startup-progress-bg">
         <div class="startup-progress-bar" id="startupProgressBar"></div>
       </div>
-      <div class="startup-stats" id="startupStats">loading segments: 0.0s / 6.0s</div>
+      <div class="startup-stats" id="startupStats">loading segments: 0.0s / 7.0s</div>
       <button class="startup-skip-btn" id="startupSkipBtn">SKIP LOADING</button>
     </div>
   </div>
@@ -52,35 +52,25 @@
         <button class="ctrl" id="proxyToggle">PROXY</button>
         <button class="ctrl" id="clearLog">CLEAR LOG</button>
         <button class="ctrl" id="reloadBtn">RELOAD</button>
+        <button class="ctrl" id="debugToggle">DEBUG</button>
         <span class="sep"></span>
         <button class="ctrl" id="copyUrl">COPY URL</button>
       </div>
 
       <div class="presets">
         <div class="presets-label">Quick Presets (direct level — bypass multivariant):</div>
-        <button class="preset-btn" data-url="https://master2.hdtvs2.top/hls/0/stream.m3u8">M2 1080p</button>
         <button class="preset-btn" data-url="https://master2.hdtvs2.top/hls/1/stream.m3u8">M2 720p</button>
         <button class="preset-btn" data-url="https://master2.hdtvs2.top/hls/2/stream.m3u8">M2 480p</button>
         <button class="preset-btn" data-url="https://master2.hdtvs2.top/hls/3/stream.m3u8">M2 360p (Fast)</button>
-        <button class="preset-btn" data-url="https://master4.hdtvs2.top/hls/0/stream.m3u8">M4 1080p</button>
-        <button class="preset-btn" data-url="https://master4.hdtvs1.top/hls/2/stream.m3u8">M4 480p</button>
-        <button class="preset-btn" data-url="http://148.251.6.207:8087/hls/stream.m3u8">IP:8087</button>
       </div>
 
       <div class="url-label" id="urlLabel">no stream loaded</div>
     </div>
 
-    <div class="log-side">
+    <div class="log-side" id="logSide">
       <div class="log-header">
-        <span>LIVE LOG</span>
-        <div class="log-filter">
-          <label><input type="checkbox" data-type="info" checked> Info</label>
-          <label><input type="checkbox" data-type="ok" checked> Ok</label>
-          <label><input type="checkbox" data-type="warn" checked> Warn</label>
-          <label><input type="checkbox" data-type="err" checked> Err</label>
-          <label><input type="checkbox" data-type="debug"> Debug</label>
-        </div>
-        <span id="logCount">0</span>
+        <span>LIVE LOG (ALL)</span>
+        <button class="ctrl" id="closeLogBtn" style="padding: 2px 8px; font-size: 10px;">CLOSE</button>
       </div>
       <div class="log-entries" id="logBox"></div>
     </div>

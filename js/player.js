@@ -18,13 +18,13 @@ class StreamPlayer {
     this.bufferWatchdog = null;
     this.prefetchedUrls = new Set();
     
-    // Log filtering
+    // Log filtering (all true by default, no individual filter checkboxes)
     this.logFilters = {
       info: true,
       ok: true,
       warn: true,
       err: true,
-      debug: false
+      debug: true
     };
 
     // DOM cache
@@ -32,12 +32,13 @@ class StreamPlayer {
     this.urlInput = document.getElementById('urlInput');
     this.statusEl = document.getElementById('status');
     this.logBox = document.getElementById('logBox');
-    this.logCountEl = document.getElementById('logCount');
+    this.logCountEl = document.getElementById('debugToggle'); // re-use for debug toggle counter or simple label
     this.urlLabel = document.getElementById('urlLabel');
     this.loadingOverlay = document.getElementById('loadingOverlay');
     this.loadingBar = document.getElementById('loadingBar');
     this.loadingText = document.getElementById('loadingText');
     this.bandwidthMeter = document.getElementById('bandwidthMeter');
+    this.logSide = document.getElementById('logSide');
 
     this.init();
   }
@@ -45,9 +46,9 @@ class StreamPlayer {
   init() {
     this.bindEvents();
     this.registerServiceWorker();
-    this.log('player ready — starting 360p auto-load...', 'info');
+    this.log('player ready — starting 480p auto-load...', 'info');
     
-    // === Opsi 1: Auto-start 360p loading with startup overlay ===
+    // === Opsi 1: Auto-start 480p loading with startup overlay ===
     this.startupLoad();
   }
 
@@ -91,19 +92,19 @@ class StreamPlayer {
     this.startupStats = document.getElementById('startupStats');
     this.startupSkipBtn = document.getElementById('startupSkipBtn');
     this.startupActive = true;
-    this.startupTargetBuffer = 6; // 6 seconds of buffer before we reveal
+    this.startupTargetBuffer = 7; // 7 seconds buffer zone for 480p startup
     this.startupStartTime = Date.now();
-    this.startupMaxTime = 8000; // 8 second hard timeout
+    this.startupMaxTime = 10000; // 10 second hard timeout
 
     // Skip button
     this.startupSkipBtn.addEventListener('click', () => {
       this.dismissStartup();
     });
 
-    // Auto-load 360p on startup
-    const url360p = 'https://master2.hdtvs2.top/hls/3/stream.m3u8';
-    document.getElementById('urlInput').value = url360p;
-    this.load(url360p);
+    // Auto-load 480p on startup
+    const url480p = 'https://master2.hdtvs2.top/hls/2/stream.m3u8';
+    document.getElementById('urlInput').value = url480p;
+    this.load(url480p);
 
     // Monitor buffer progress during startup
     this.startupMonitor = setInterval(() => {
@@ -156,7 +157,7 @@ class StreamPlayer {
     this.setStatus('live', 'ok');
     this.hideLoading();
     
-    this.log('startup complete — playing 360p', 'ok');
+    this.log('startup complete — playing 480p', 'ok');
   }
 
   bindEvents() {
@@ -185,60 +186,62 @@ class StreamPlayer {
     });
 
     document.getElementById('clearLog').addEventListener('click', () => {
-      this.logBox.innerHTML = '';
-      this.logTotal = 0;
-      this.logCountEl.textContent = '0';
-    });
+    this.logBox.innerHTML = '';
+    this.logTotal = 0;
+    this.updateDebugButtonText();
+  });
 
-    document.getElementById('copyUrl').addEventListener('click', () => {
-      if (!this.currentUrl) return;
-      navigator.clipboard.writeText(this.currentUrl).then(() => {
-        this.log('URL copied to clipboard', 'ok');
-      }).catch(() => {
-        this.log('clipboard copy failed', 'err');
-      });
-    });
+  document.getElementById('debugToggle').addEventListener('click', () => {
+    this.logSide.classList.toggle('visible');
+    // Scroll logs to bottom when opened
+    if (this.logSide.classList.contains('visible')) {
+      this.logBox.scrollTop = this.logBox.scrollHeight;
+    }
+  });
 
-    document.querySelectorAll('.preset-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const url = btn.dataset.url;
-        this.urlInput.value = url;
-        this.load(url);
-      });
-    });
+  document.getElementById('closeLogBtn').addEventListener('click', () => {
+    this.logSide.classList.remove('visible');
+  });
 
-    document.querySelectorAll('.log-filter input[type="checkbox"]').forEach(cb => {
-      cb.addEventListener('change', (e) => {
-        const type = e.target.dataset.type;
-        this.logFilters[type] = e.target.checked;
-        this.applyLogFilters();
-      });
+  document.getElementById('copyUrl').addEventListener('click', () => {
+    if (!this.currentUrl) return;
+    navigator.clipboard.writeText(this.currentUrl).then(() => {
+      this.log('URL copied to clipboard', 'ok');
+    }).catch(() => {
+      this.log('clipboard copy failed', 'err');
     });
+  });
+
+  document.querySelectorAll('.preset-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const url = btn.dataset.url;
+      this.urlInput.value = url;
+      this.load(url);
+    });
+  });
+}
+
+applyLogFilters() {
+  // All log filters are true now
+}
+
+log(text, type = 'info') {
+  const now = new Date().toLocaleTimeString('id-ID', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const div = document.createElement('div');
+  div.className = 'log-line ' + type;
+  div.innerHTML = '<span class="time">[' + now + ']</span>' + this.escapeHtml(text);
+  this.logBox.appendChild(div);
+  this.logBox.scrollTop = this.logBox.scrollHeight;
+  this.logTotal++;
+  this.updateDebugButtonText();
+}
+
+updateDebugButtonText() {
+  const btn = document.getElementById('debugToggle');
+  if (btn) {
+    btn.textContent = 'DEBUG (' + this.logTotal + ')';
   }
-
-  applyLogFilters() {
-    document.querySelectorAll('.log-line').forEach(line => {
-      const types = ['info', 'ok', 'warn', 'err', 'debug'];
-      const lineType = types.find(t => line.classList.contains(t));
-      if (lineType && !this.logFilters[lineType]) {
-        line.classList.add('hidden');
-      } else {
-        line.classList.remove('hidden');
-      }
-    });
-  }
-
-  log(text, type = 'info') {
-    const now = new Date().toLocaleTimeString('id-ID', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    const div = document.createElement('div');
-    div.className = 'log-line ' + type;
-    if (!this.logFilters[type]) div.classList.add('hidden');
-    div.innerHTML = '<span class="time">[' + now + ']</span>' + this.escapeHtml(text);
-    this.logBox.appendChild(div);
-    this.logBox.scrollTop = this.logBox.scrollHeight;
-    this.logTotal++;
-    this.logCountEl.textContent = this.logTotal;
-  }
+}
 
   escapeHtml(t) {
     return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
