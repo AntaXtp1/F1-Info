@@ -285,13 +285,16 @@ class StreamPlayer {
         debug: false,
         
         // Live stream config — stay further back for slow connections
-        liveSyncDurationCount: 4,
-        liveMaxLatencyDurationCount: 12,
-        maxLiveSyncPlaybackRate: 1.0,
+        liveSyncDurationCount: 5,
+        liveMaxLatencyDurationCount: 15,
+        
+        // Dynamic Playback Rate to prevent stalls on slow connections
+        // Slow down playback slightly (0.9x) if buffer is low to let download catch up
+        maxLiveSyncPlaybackRate: 0.9,
         
         // Buffer tuning — LARGER buffer to sustain slow segment loads
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
+        maxBufferLength: 45,
+        maxMaxBufferLength: 90,
         backBufferLength: 0,
         
         // Gap handling — more tolerant
@@ -314,11 +317,16 @@ class StreamPlayer {
         fragLoadingRetryDelay: 1000,
         fragLoadingMaxRetryTimeout: 64000,
         
-        // ABR — lock to level 0
+        // ABR — lock to level 0 but allow lower if available
         startLevel: 0,
         capLevelToPlayerSize: false,
         
-        // XHR setup — force binary + bypass MIME check
+        // Custom fLoader to parallelize/optimise fetching if needed
+        // but for now we increase network timeouts
+        fragLoadingTimeOut: 45000,
+        fragLoadingMaxRetry: 10,
+        fragLoadingRetryDelay: 500,
+        fragLoadingMaxRetryTimeout: 90000,
         xhrSetup: (xhr, url) => {
           xhr.responseType = 'arraybuffer';
           xhr.overrideMimeType('application/octet-stream');
