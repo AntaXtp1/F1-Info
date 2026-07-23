@@ -1,116 +1,119 @@
-// Service Worker v1 — HLS Segment Prefetch Cache
-// Intercepts .html/.ts segment requests, serves from Cache API when available
+// Service Worker v2 — HLS Prefetch + PWA Support
+const CACHE_NAME = 'f1-live-assets-v2';
+const SEGMENT_CACHE = 'f1-live-segments-v2';
 
-const CACHE_NAME = 'hls-segment-cache-v1';
-const PREFETCH_AHEAD = 5; // prefetch 5 segments ahead
-const MAX_CACHE_ENTRIES = 30; // max 30 segments cached (prevents memory leak)
+const STATIC_ASSETS = [
+  '/',
+  '/index.html',
+  '/css/style.css',
+  '/js/player.js',
+  '/manifest.json',
+  '/favicon.ico',
+  '/icons/icon-192x192.png',
+  '/icons/icon-512x512.png'
+];
 
-let currentManifest = null;
-let lastKnownSN = null;
-
-// Install — activate immediately
 self.addEventListener('install', (event) => {
   self.skipWaiting();
-});
-
-// Activate — claim all clients
-self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then(() => self.clients.claim())
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(STATIC_ASSETS))
   );
 });
 
-// Fetch — intercept segment requests
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) => {
+      return Promise.all(
+        keys.map((key) => {
+          if (key !== CACHE_NAME && key !== SEGMENT_CACHE) {
+            return caches.delete(key);
+          }
+        })
+      );
+    }).then(() => self.clients.claim())
+  );
+});
+
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
 
-  // Only intercept segment files (.html extension from hdtvs2 streams)
-  if (!url.hostname.includes('hdtvs2') && !url.hostname.includes('dryproxy')) return;
-  if (!url.pathname.includes('.html') && !url.pathname.match(/\.ts$/)) return;
+  // 1. Static assets cache first
+  if (STATIC_ASSETS.includes(url.pathname)) {
+    event.respondWith(
+      caches.match(event.request).then((res) => res || fetch(event.request))
+    );
+    return;
+  }
 
-  event.respondWith(
-    caches.open(CACHE_NAME).then(async (cache) => {
-      // Check cache first
-      const cached = await cache.match(event.request);
-      if (cached) {
-        // Notify clients about cache hit (for log panel)
-        notifyClients({ type: 'cache-hit', url: url.pathname.split('/').pop() });
-        return cached;
-      }
-
-      // Cache miss — fetch from network, cache result
-      try {
-        const response = await fetch(event.request);
-        if (response.ok) {
-          // Clone because response body can only be consumed once
-          const clone = response.clone();
-          cache.put(event.request, clone);
-
-          // Prune old entries
-          pruneCache(cache);
-
-          // Notify clients
-          notifyClients({ type: 'cache-store', url: url.pathname.split('/').pop() });
+  // 2. Intercept segment requests
+  if ((url.hostname.includes('hdtvs2') || url.hostname.includes('dryproxy')) && 
+      (url.pathname.includes('.html') || url.pathname.match(/\.ts$/))) {
+    
+    event.respondWith(
+      caches.open(SEGMENT_CACHE).then(async (cache) => {
+        const cached = await cache.match(event.request);
+        if (cached) {
+          notifyClients({ type: 'cache-hit', url: url.pathname.split('/').pop() });
+          return cached;
         }
-        return response;
-      } catch (err) {
-        notifyClients({ type: 'cache-error', url: url.pathname.split('/').pop(), error: err.message });
-        throw err;
-      }
-    })
-  );
+
+        try {
+          const response = await fetch(event.request);
+          if (response.ok) {
+            cache.put(event.request, response.clone());
+            pruneCache(cache, 30);
+            notifyClients({ type: 'cache-store', url: url.pathname.split('/').pop() });
+          }
+          return response;
+        } catch (err) {
+          return fetch(event.request);
+        }
+      })
+    );
+    return;
+  }
+
+  // Normal request bypass
+  event.respondWith(fetch(event.request).catch(() => caches.match(event.request)));
 });
 
-// Listen for manifest updates from the main page (tells SW which segments to prefetch)
+// Communication with player
 self.addEventListener('message', async (event) => {
   if (event.data?.type === 'prefetch-segments') {
     const { segments, proxyUrl, useProxy } = event.data;
-    const cache = await caches.open(CACHE_NAME);
+    const cache = await caches.open(SEGMENT_CACHE);
 
     for (const seg of segments) {
-      const cacheKey = seg.url;
-      const cached = await cache.match(cacheKey);
-      if (cached) continue; // already cached
+      const cached = await cache.match(seg.url);
+      if (cached) continue;
 
       try {
         const fetchUrl = useProxy ? proxyUrl + encodeURIComponent(seg.url) : seg.url;
-        const res = await fetch(fetchUrl, {
-          mode: 'cors',
-          credentials: 'omit'
-        });
+        const res = await fetch(fetchUrl, { mode: 'cors', credentials: 'omit' });
         if (res.ok) {
-          const clone = res.clone();
-          // Store with original URL as key (so XHR lookup works)
-          await cache.put(new Request(seg.url), clone);
+          await cache.put(new Request(seg.url), res.clone());
           notifyClients({ type: 'sw-prefetch', url: seg.url.split('/').pop(), sn: seg.sn });
         }
-      } catch (e) {
-        // quiet fail
-      }
+      } catch (e) {}
     }
-
-    // Prune after prefetch
-    pruneCache(cache);
+    pruneCache(cache, 30);
   }
 
   if (event.data?.type === 'clear-cache') {
-    await caches.delete(CACHE_NAME);
+    await caches.delete(SEGMENT_CACHE);
     notifyClients({ type: 'cache-cleared' });
   }
 });
 
-// Prune oldest entries when cache exceeds MAX_CACHE_ENTRIES
-async function pruneCache(cache) {
+async function pruneCache(cache, maxEntries) {
   const keys = await cache.keys();
-  if (keys.length <= MAX_CACHE_ENTRIES) return;
-
-  const toDelete = keys.length - MAX_CACHE_ENTRIES;
+  if (keys.length <= maxEntries) return;
+  const toDelete = keys.length - maxEntries;
   for (let i = 0; i < toDelete; i++) {
     await cache.delete(keys[i]);
   }
 }
 
-// Notify all connected clients (the player page)
 function notifyClients(msg) {
   self.clients.matchAll().then(clients => {
     clients.forEach(client => client.postMessage(msg));

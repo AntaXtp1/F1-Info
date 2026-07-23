@@ -92,9 +92,10 @@ class StreamPlayer {
     this.startupStats = document.getElementById('startupStats');
     this.startupSkipBtn = document.getElementById('startupSkipBtn');
     this.startupActive = true;
-    this.startupTargetBuffer = 7; // 7 seconds buffer zone for 480p startup
+    this.startupTargetBuffer = 12; // 12s buffer zone (range 10-15s for 480p)
     this.startupStartTime = Date.now();
-    this.startupMaxTime = 10000; // 10 second hard timeout
+    this.startupMaxTime = 15000; // 15 second hard timeout
+    this.startupLastBuffer = 0; // track last buffer for smooth progress
 
     // Skip button
     this.startupSkipBtn.addEventListener('click', () => {
@@ -113,23 +114,43 @@ class StreamPlayer {
       const elapsed = Date.now() - this.startupStartTime;
       const buffered = this.video.buffered;
       let bufferedSec = 0;
+      
       if (buffered.length > 0) {
-        bufferedSec = buffered.end(buffered.length - 1) - this.video.currentTime;
+        // Find largest buffer chunk ahead of current play position
+        const currentPos = this.video.currentTime;
+        for (let i = 0; i < buffered.length; i++) {
+          const start = buffered.start(i);
+          const end = buffered.end(i);
+          if (currentPos >= start && currentPos <= end) {
+            bufferedSec = end - currentPos;
+            break;
+          }
+        }
+        // Fallback to absolute end if currentPos not in range yet
+        if (bufferedSec === 0) {
+          bufferedSec = buffered.end(buffered.length - 1) - currentPos;
+        }
       }
 
-      const progress = Math.min(100, (bufferedSec / this.startupTargetBuffer) * 100);
+      // Smooth progress calculation (always increase, never jump backward)
+      if (bufferedSec > this.startupLastBuffer) {
+        this.startupLastBuffer = bufferedSec;
+      }
+      
+      // Safety calculation for progress percentage
+      const progress = Math.min(100, (this.startupLastBuffer / this.startupTargetBuffer) * 100);
       this.startupProgressBar.style.width = progress + '%';
-      this.startupStats.textContent = 'buffer: ' + bufferedSec.toFixed(1) + 's / ' + this.startupTargetBuffer + 's';
+      this.startupStats.textContent = 'buffer: ' + this.startupLastBuffer.toFixed(1) + 's / ' + this.startupTargetBuffer + 's';
       this.startupProgressBar.style.background = progress >= 100 ? '#4ade80' : '#e63946';
 
       // Dismiss conditions: buffer target met OR hard timeout
-      if (bufferedSec >= this.startupTargetBuffer) {
+      if (this.startupLastBuffer >= this.startupTargetBuffer) {
         this.dismissStartup();
       } else if (elapsed >= this.startupMaxTime) {
         this.log('startup timeout — playing with partial buffer', 'warn');
         this.dismissStartup();
       }
-    }, 200);
+    }, 150);
   }
 
   dismissStartup() {
@@ -161,6 +182,47 @@ class StreamPlayer {
   }
 
   bindEvents() {
+    // PWA Install Event Handler
+    this.deferredInstallPrompt = null;
+    const installBtn = document.getElementById('installAppBtn');
+    
+    window.addEventListener('beforeinstallprompt', (e) => {
+      // Prevent standard mini-infobar from showing
+      e.preventDefault();
+      // Stash the event so it can be triggered later
+      this.deferredInstallPrompt = e;
+      // Show the install button
+      if (installBtn) {
+        installBtn.style.display = 'inline-block';
+        this.log('PWA installation ready to install', 'ok');
+      }
+    });
+
+    if (installBtn) {
+      installBtn.addEventListener('click', () => {
+        if (!this.deferredInstallPrompt) return;
+        // Show the prompt
+        this.deferredInstallPrompt.prompt();
+        // Wait for the user to respond to the prompt
+        this.deferredInstallPrompt.userChoice.then((choiceResult) => {
+          if (choiceResult.outcome === 'accepted') {
+            this.log('User accepted the PWA install prompt', 'ok');
+          } else {
+            this.log('User dismissed the PWA install prompt', 'info');
+          }
+          this.deferredInstallPrompt = null;
+          installBtn.style.display = 'none';
+        });
+      });
+    }
+
+    // Hide install button when app is installed
+    window.addEventListener('appinstalled', () => {
+      this.log('F1 Live installed successfully', 'ok');
+      if (installBtn) installBtn.style.display = 'none';
+      this.deferredInstallPrompt = null;
+    });
+
     document.getElementById('loadBtn').addEventListener('click', () => {
       const url = this.urlInput.value.trim();
       if (url) this.load(url);
