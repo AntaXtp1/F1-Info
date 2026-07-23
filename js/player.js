@@ -1,5 +1,112 @@
-// F1 Stream Player v6 — Production Ready
-// Fixed: xhrSetup restore, event leak cleanup, watchdog leak fix
+// F1 Stream Player v7 — Parallel Pre-fetch Fragment Loader
+// Fixed: Custom fLoader to parallelize segment downloads for slow connections
+
+class PrefetchLoader extends Hls.DefaultConfig.loader {
+  constructor(config) {
+    super(config);
+    if (!window.prefetchCache) {
+      window.prefetchCache = new Map();
+      window.activePrefetches = new Set();
+    }
+  }
+
+  load(context, config, callbacks) {
+    const url = context.url;
+    
+    // If it's not a media segment (e.g. manifest/playlist), use default loader
+    if (!url.includes('.html') && !url.includes('.ts')) {
+      super.load(context, config, callbacks);
+      return;
+    }
+
+    // Check if we have this segment pre-fetched in cache
+    if (window.prefetchCache.has(url)) {
+      const data = window.prefetchCache.get(url);
+      window.prefetchCache.delete(url); // consume once
+      
+      const stats = {
+        trequest: performance.now() - 10,
+        tfirst: performance.now() - 5,
+        tload: performance.now(),
+        loaded: data.byteLength,
+        total: data.byteLength
+      };
+      
+      callbacks.onSuccess({ data }, stats, context);
+      
+      // Trigger pre-fetch for next segments
+      this.triggerPrefetchOfNextSegments(context);
+      return;
+    }
+
+    // Fallback: load normally but also trigger prefetch for next ones
+    const originalSuccess = callbacks.onSuccess;
+    callbacks.onSuccess = (response, stats, context) => {
+      originalSuccess(response, stats, context);
+      this.triggerPrefetchOfNextSegments(context);
+    };
+
+    super.load(context, config, callbacks);
+  }
+
+  triggerPrefetchOfNextSegments(context) {
+    try {
+      const details = window.player?.hls?.levels?.[window.player?.hls?.currentLevel]?.details;
+      if (!details || !details.fragments) return;
+
+      const frags = details.fragments;
+      const currentSn = context.frag?.sn;
+      if (typeof currentSn !== 'number') return;
+
+      // Prefetch up to 3 next segments
+      const prefetchCount = 3;
+      for (let i = 1; i <= prefetchCount; i++) {
+        const nextFrag = frags.find(f => f.sn === currentSn + i);
+        if (nextFrag && nextFrag.url) {
+          this.prefetch(nextFrag.url);
+        }
+      }
+    } catch (e) {
+      // quiet
+    }
+  }
+
+  async prefetch(url) {
+    if (window.prefetchCache.has(url) || window.activePrefetches.has(url)) {
+      return;
+    }
+
+    if (window.prefetchCache.size > 8) {
+      // Clear oldest to prevent leak
+      const firstKey = window.prefetchCache.keys().next().value;
+      window.prefetchCache.delete(firstKey);
+    }
+
+    window.activePrefetches.add(url);
+    
+    try {
+      let fetchUrl = url;
+      if (window.player?.useProxy && window.player?.PROXY_URL) {
+        fetchUrl = window.player.PROXY_URL + encodeURIComponent(url);
+      }
+
+      const res = await fetch(fetchUrl, {
+        headers: {
+          'Accept': '*/*',
+        }
+      });
+      
+      if (!res.ok) throw new Error('status ' + res.status);
+      
+      const buffer = await res.arrayBuffer();
+      window.prefetchCache.set(url, buffer);
+    } catch (e) {
+      // quiet fail
+    } finally {
+      window.activePrefetches.delete(url);
+    }
+  }
+}
 
 class StreamPlayer {
   constructor() {
@@ -284,49 +391,42 @@ class StreamPlayer {
         enableWorker: false,
         debug: false,
         
-        // Live stream config — stay further back for slow connections
-        liveSyncDurationCount: 5,
-        liveMaxLatencyDurationCount: 15,
+        // Inject Custom Parallel Loader
+        fLoader: PrefetchLoader,
         
-        // Dynamic Playback Rate to prevent stalls on slow connections
-        // Slow down playback slightly (0.9x) if buffer is low to let download catch up
-        maxLiveSyncPlaybackRate: 0.9,
+        // Live stream config
+        liveSyncDurationCount: 3,
+        liveMaxLatencyDurationCount: 10,
+        maxLiveSyncPlaybackRate: 1.1,
         
-        // Buffer tuning — LARGER buffer to sustain slow segment loads
-        maxBufferLength: 45,
-        maxMaxBufferLength: 90,
+        // Buffer tuning
+        maxBufferLength: 15,
+        maxMaxBufferLength: 30,
         backBufferLength: 0,
         
-        // Gap handling — more tolerant
-        maxBufferHole: 0.8,
+        // Gap handling
+        maxBufferHole: 0.5,
         highBufferWatchdogPeriod: 2,
-        nudgeMaxRetry: 15,
-        nudgeOffset: 0.05,
+        nudgeMaxRetry: 10,
         
-        // Network retry — very aggressive for slow/unreliable connections
+        // Network retry
         manifestLoadingTimeOut: 15000,
-        manifestLoadingMaxRetry: 5,
+        manifestLoadingMaxRetry: 4,
         manifestLoadingRetryDelay: 1000,
         
         levelLoadingTimeOut: 15000,
-        levelLoadingMaxRetry: 5,
+        levelLoadingMaxRetry: 4,
         levelLoadingRetryDelay: 1000,
         
         fragLoadingTimeOut: 30000,
-        fragLoadingMaxRetry: 8,
+        fragLoadingMaxRetry: 6,
         fragLoadingRetryDelay: 1000,
         fragLoadingMaxRetryTimeout: 64000,
         
-        // ABR — lock to level 0 but allow lower if available
+        // ABR
         startLevel: 0,
         capLevelToPlayerSize: false,
         
-        // Custom fLoader to parallelize/optimise fetching if needed
-        // but for now we increase network timeouts
-        fragLoadingTimeOut: 45000,
-        fragLoadingMaxRetry: 10,
-        fragLoadingRetryDelay: 500,
-        fragLoadingMaxRetryTimeout: 90000,
         xhrSetup: (xhr, url) => {
           xhr.responseType = 'arraybuffer';
           xhr.overrideMimeType('application/octet-stream');
