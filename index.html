@@ -8,6 +8,21 @@
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
+  <!-- Fullscreen Loading Overlay (Startup Lock) -->
+  <div class="startup-overlay" id="startupOverlay">
+    <div class="startup-box">
+      <div class="live-dot big"></div>
+      <h2 class="startup-title">F1 LIVE STREAM</h2>
+      <p class="startup-subtitle">initiating parallel segment prefetch...</p>
+      
+      <div class="startup-progress-bg">
+        <div class="startup-progress-bar" id="startupProgressBar"></div>
+      </div>
+      <div class="startup-stats" id="startupStats">loading segments: 0.0s / 6.0s</div>
+      <button class="startup-skip-btn" id="startupSkipBtn">SKIP LOADING</button>
+    </div>
+  </div>
+
   <div class="header">
     <span class="live-dot"></span>
     <h1>F1 LIVE v4</h1>
@@ -30,7 +45,7 @@
             <div class="loading-bar" id="loadingBar"></div>
           </div>
         </div>
-        <video id="video" controls playsinline></video>
+        <video id="video" controls playsinline muted></video>
       </div>
 
       <div class="controls">

@@ -44,7 +44,119 @@ class StreamPlayer {
 
   init() {
     this.bindEvents();
-    this.log('player ready — paste URL or pick preset', 'info');
+    this.registerServiceWorker();
+    this.log('player ready — starting 360p auto-load...', 'info');
+    
+    // === Opsi 1: Auto-start 360p loading with startup overlay ===
+    this.startupLoad();
+  }
+
+  registerServiceWorker() {
+    if (!('serviceWorker' in navigator)) {
+      this.log('service worker not supported', 'warn');
+      return;
+    }
+    navigator.serviceWorker.register('/sw.js')
+      .then(reg => {
+        this.log('service worker registered', 'ok');
+        // Listen for SW messages (cache hits, prefetch logs)
+        navigator.serviceWorker.addEventListener('message', (event) => {
+          const msg = event.data;
+          if (msg?.type === 'sw-prefetch') {
+            this.log('SW cached seg ' + msg.sn + ' (' + msg.url + ')', 'debug');
+          } else if (msg?.type === 'cache-hit') {
+            this.log('SW cache hit: ' + msg.url, 'debug');
+          }
+        });
+      })
+      .catch(err => {
+        this.log('SW registration failed: ' + err.message, 'warn');
+      });
+  }
+
+  // Tell Service Worker to prefetch upcoming segments
+  prefetchViaSW(segments) {
+    if (!navigator.serviceWorker?.controller) return;
+    navigator.serviceWorker.controller.postMessage({
+      type: 'prefetch-segments',
+      segments: segments.slice(0, 5).map(f => ({ url: f.url, sn: f.sn })),
+      proxyUrl: this.PROXY_URL,
+      useProxy: this.useProxy
+    });
+  }
+
+  startupLoad() {
+    this.startupOverlay = document.getElementById('startupOverlay');
+    this.startupProgressBar = document.getElementById('startupProgressBar');
+    this.startupStats = document.getElementById('startupStats');
+    this.startupSkipBtn = document.getElementById('startupSkipBtn');
+    this.startupActive = true;
+    this.startupTargetBuffer = 6; // 6 seconds of buffer before we reveal
+    this.startupStartTime = Date.now();
+    this.startupMaxTime = 8000; // 8 second hard timeout
+
+    // Skip button
+    this.startupSkipBtn.addEventListener('click', () => {
+      this.dismissStartup();
+    });
+
+    // Auto-load 360p on startup
+    const url360p = 'https://master2.hdtvs2.top/hls/3/stream.m3u8';
+    document.getElementById('urlInput').value = url360p;
+    this.load(url360p);
+
+    // Monitor buffer progress during startup
+    this.startupMonitor = setInterval(() => {
+      if (!this.startupActive) return;
+      
+      const elapsed = Date.now() - this.startupStartTime;
+      const buffered = this.video.buffered;
+      let bufferedSec = 0;
+      if (buffered.length > 0) {
+        bufferedSec = buffered.end(buffered.length - 1) - this.video.currentTime;
+      }
+
+      const progress = Math.min(100, (bufferedSec / this.startupTargetBuffer) * 100);
+      this.startupProgressBar.style.width = progress + '%';
+      this.startupStats.textContent = 'buffer: ' + bufferedSec.toFixed(1) + 's / ' + this.startupTargetBuffer + 's';
+      this.startupProgressBar.style.background = progress >= 100 ? '#4ade80' : '#e63946';
+
+      // Dismiss conditions: buffer target met OR hard timeout
+      if (bufferedSec >= this.startupTargetBuffer) {
+        this.dismissStartup();
+      } else if (elapsed >= this.startupMaxTime) {
+        this.log('startup timeout — playing with partial buffer', 'warn');
+        this.dismissStartup();
+      }
+    }, 200);
+  }
+
+  dismissStartup() {
+    if (!this.startupActive) return;
+    this.startupActive = false;
+    
+    if (this.startupMonitor) {
+      clearInterval(this.startupMonitor);
+      this.startupMonitor = null;
+    }
+    
+    this.startupOverlay.classList.add('hidden');
+    
+    // Unmute video on user click dismiss/skip
+    this.video.muted = false;
+    
+    // Force play
+    this.video.play().catch(e => {
+      this.log('autoplay blocked after startup: ' + e.message, 'warn');
+      // Show play overlay button if browser still blocks it
+      this.video.muted = true;
+      this.video.play().catch(() => {});
+    });
+    
+    this.setStatus('live', 'ok');
+    this.hideLoading();
+    
+    this.log('startup complete — playing 360p', 'ok');
   }
 
   bindEvents() {
@@ -413,16 +525,17 @@ class StreamPlayer {
           const frags = data.details?.fragments;
           if (!frags || frags.length === 0) return;
 
-          // Prefetch first 5 segments immediately before playback starts
-          const toPrefetch = frags.slice(0, 5);
-          toPrefetch.forEach(f => {
+          // Prefetch first 5 via Service Worker
+          this.prefetchViaSW(frags.slice(0, 5));
+          // Also prefetch via direct fetch as fallback
+          frags.slice(0, 5).forEach(f => {
             if (f.url) this.prefetchSegment(f.url);
           });
-          this.log('pre-fetching ' + toPrefetch.length + ' initial segments', 'debug');
+          this.log('pre-fetching 5 initial segments', 'debug');
         } catch (e) {}
       });
 
-      // === FRAG_LOADED (Trigger Prefetch for next 4 segments) ===
+      // === FRAG_LOADED (Trigger Prefetch for next 4 segments via SW) ===
       this.hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
         try {
           const details = this.hls?.levels?.[this.hls.currentLevel]?.details;
@@ -432,17 +545,20 @@ class StreamPlayer {
           const currentSn = data.frag?.sn;
           if (typeof currentSn !== 'number') return;
 
-          // Prefetch next 4 segments into browser cache
-          let prefCount = 0;
+          const nextFrags = [];
           for (let i = 1; i <= 4; i++) {
             const nextFrag = frags.find(f => f.sn === currentSn + i);
-            if (nextFrag && nextFrag.url) {
-              this.prefetchSegment(nextFrag.url);
-              prefCount++;
-            }
+            if (nextFrag?.url) nextFrags.push(nextFrag);
           }
-          if (prefCount > 0) {
-            this.log('pre-fetched ' + prefCount + ' segments ahead of seg ' + currentSn, 'debug');
+
+          // Send to SW for parallel prefetch
+          this.prefetchViaSW(nextFrags);
+          
+          // Also direct fetch as fallback
+          nextFrags.forEach(f => this.prefetchSegment(f.url));
+
+          if (nextFrags.length > 0) {
+            this.log('pre-fetched ' + nextFrags.length + ' segments ahead of seg ' + currentSn, 'debug');
           }
         } catch (e) {
           this.log('prefetch error: ' + e.message, 'debug');
