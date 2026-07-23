@@ -193,12 +193,12 @@ class StreamPlayer {
     
     const bufferedEnd = buffered.end(buffered.length - 1);
     const bufferedSec = bufferedEnd - this.video.currentTime;
-    const targetBuffer = 3;
-    const progress = Math.min(95, 50 + (bufferedSec / targetBuffer) * 45);
+    const targetBuffer = 8;
+    const progress = Math.min(95, 30 + (bufferedSec / targetBuffer) * 65);
     
     if (bufferedSec < 0) {
       this.loadingText.textContent = 'rebuffering... (buffer empty)';
-      this.updateLoadingProgress(50);
+      this.updateLoadingProgress(30);
       this.setStatus('rebuffering', 'warn');
       return;
     }
@@ -284,36 +284,37 @@ class StreamPlayer {
         enableWorker: false,
         debug: false,
         
-        // Live stream config — stay close to live edge
-        liveSyncDurationCount: 2,
-        liveMaxLatencyDurationCount: 10,
-        maxLiveSyncPlaybackRate: 1.2,
+        // Live stream config — stay further back for slow connections
+        liveSyncDurationCount: 4,
+        liveMaxLatencyDurationCount: 12,
+        maxLiveSyncPlaybackRate: 1.0,
         
-        // Buffer tuning — smaller buffer for faster startup
-        maxBufferLength: 10,
-        maxMaxBufferLength: 20,
+        // Buffer tuning — LARGER buffer to sustain slow segment loads
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
         backBufferLength: 0,
         
-        // Gap handling — let hls.js fix gaps automatically
-        maxBufferHole: 0.5,
-        highBufferWatchdogPeriod: 1,
-        nudgeMaxRetry: 10,
+        // Gap handling — more tolerant
+        maxBufferHole: 0.8,
+        highBufferWatchdogPeriod: 2,
+        nudgeMaxRetry: 15,
+        nudgeOffset: 0.05,
         
-        // Network retry — aggressive for poor connections
-        manifestLoadingTimeOut: 10000,
-        manifestLoadingMaxRetry: 3,
-        manifestLoadingRetryDelay: 500,
+        // Network retry — very aggressive for slow/unreliable connections
+        manifestLoadingTimeOut: 15000,
+        manifestLoadingMaxRetry: 5,
+        manifestLoadingRetryDelay: 1000,
         
-        levelLoadingTimeOut: 10000,
-        levelLoadingMaxRetry: 3,
-        levelLoadingRetryDelay: 500,
+        levelLoadingTimeOut: 15000,
+        levelLoadingMaxRetry: 5,
+        levelLoadingRetryDelay: 1000,
         
-        fragLoadingTimeOut: 20000,
-        fragLoadingMaxRetry: 4,
-        fragLoadingRetryDelay: 500,
-        fragLoadingMaxRetryTimeout: 32000,
+        fragLoadingTimeOut: 30000,
+        fragLoadingMaxRetry: 8,
+        fragLoadingRetryDelay: 1000,
+        fragLoadingMaxRetryTimeout: 64000,
         
-        // ABR — lock to level 0 (direct level URL = no ABR needed)
+        // ABR — lock to level 0
         startLevel: 0,
         capLevelToPlayerSize: false,
         
