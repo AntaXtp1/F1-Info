@@ -210,11 +210,31 @@ class StreamPlayer {
     if (bufferedSec >= targetBuffer) {
       this.hideLoading();
       this.setStatus('live', 'ok');
+      
+      // Dynamic playback rate — slow down to let download catch up
+      this.adjustPlaybackRate(bufferedSec);
+      
       if (this.video.paused) {
         this.video.play().catch(e => {
           this.log('autoplay blocked: ' + e.message, 'warn');
         });
       }
+    }
+  }
+  
+  // Imperceptible playback rate adjustment to prevent buffer stalls
+  adjustPlaybackRate(bufferedSec) {
+    const v = this.video;
+    if (!v || v.paused) return;
+    
+    if (bufferedSec < 3) {
+      v.playbackRate = 0.92; // 8% slower — imperceptible but buys time
+    } else if (bufferedSec < 6) {
+      v.playbackRate = 0.95; // 5% slower
+    } else if (bufferedSec < 10) {
+      v.playbackRate = 0.98; // 2% slower
+    } else {
+      v.playbackRate = 1.0;  // normal — buffer is healthy
     }
   }
 
@@ -591,12 +611,19 @@ class StreamPlayer {
         this.log('STALLED — network interrupted', 'warn');
       };
 
-      const onPlaying = () => {
+      this.video.addEventListener('playing', () => {
         this.log('playback resumed', 'ok');
         this.setStatus('live', 'ok');
         this.hideLoading();
         this.stallRecoveryAttempts = 0;
-      };
+        
+        // Reset playback rate when playing starts/resumes
+        const buffered = this.video.buffered;
+        if (buffered.length > 0) {
+          const bufferedSec = buffered.end(buffered.length - 1) - this.video.currentTime;
+          this.adjustPlaybackRate(bufferedSec);
+        }
+      });
 
       const onError = () => {
         const err = this.video.error;
