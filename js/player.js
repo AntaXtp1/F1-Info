@@ -142,9 +142,15 @@ class StreamPlayer {
     
     this.startupOverlay.classList.add('hidden');
     
+    // Unmute video on user click dismiss/skip
+    this.video.muted = false;
+    
     // Force play
     this.video.play().catch(e => {
       this.log('autoplay blocked after startup: ' + e.message, 'warn');
+      // Show play overlay button if browser still blocks it
+      this.video.muted = true;
+      this.video.play().catch(() => {});
     });
     
     this.setStatus('live', 'ok');
