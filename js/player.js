@@ -346,7 +346,7 @@ class StreamPlayer {
         fragLoadingRetryDelay: 1000,
         fragLoadingMaxRetryTimeout: 64000,
         
-        // ABR
+        // ABR — force to lowest level (360p) on start, let it adapt up if speed allows
         startLevel: 0,
         capLevelToPlayerSize: false,
         
