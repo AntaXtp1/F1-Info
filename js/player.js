@@ -740,7 +740,7 @@ class StreamPlayer {
         this.log('STALLED — network interrupted', 'warn');
       };
 
-      this.video.addEventListener('playing', () => {
+      const onPlaying = () => {
         this.log('playback resumed', 'ok');
         this.setStatus('live', 'ok');
         this.hideLoading();
@@ -752,7 +752,7 @@ class StreamPlayer {
           const bufferedSec = buffered.end(buffered.length - 1) - this.video.currentTime;
           this.adjustPlaybackRate(bufferedSec);
         }
-      });
+      };
 
       const onError = () => {
         const err = this.video.error;
