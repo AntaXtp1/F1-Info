@@ -92,9 +92,9 @@ class StreamPlayer {
     this.startupStats = document.getElementById('startupStats');
     this.startupSkipBtn = document.getElementById('startupSkipBtn');
     this.startupActive = true;
-    this.startupTargetBuffer = 12; // 12s buffer zone (range 10-15s for 480p)
+    this.startupTargetBuffer = 10; // 10s buffer target (flexible range 10-15s)
     this.startupStartTime = Date.now();
-    this.startupMaxTime = 15000; // 15 second hard timeout
+    this.startupMaxTime = 15000; // 15 seconds initial loading timeout
     this.startupLastBuffer = 0; // track last buffer for smooth progress
 
     // Skip button
@@ -404,18 +404,34 @@ updateDebugButtonText() {
   }
   
   // Imperceptible playback rate adjustment to prevent buffer stalls
+  // + live latency catch-up to reduce real-time gap
   adjustPlaybackRate(bufferedSec) {
     const v = this.video;
     if (!v || v.paused) return;
     
+    // === Buffer health ===
     if (bufferedSec < 3) {
-      v.playbackRate = 0.92; // 8% slower — imperceptible but buys time
+      v.playbackRate = 0.92; // 8% slower — buys time when buffer is critically low
     } else if (bufferedSec < 6) {
       v.playbackRate = 0.95; // 5% slower
     } else if (bufferedSec < 10) {
-      v.playbackRate = 0.98; // 2% slower
+      v.playbackRate = 0.98; // 2% slower — mild catch-up zone
     } else {
-      v.playbackRate = 1.0;  // normal — buffer is healthy
+      // Buffer is healthy (10s+) — check live latency
+      v.playbackRate = 1.0;
+      
+      // === Live latency catch-up ===
+      if (this.hls && this.hls.liveSyncPosition != null && v.currentTime < this.hls.liveSyncPosition) {
+        const liveLatency = this.hls.liveSyncPosition - v.currentTime;
+        
+        if (liveLatency > 18) {
+          v.playbackRate = 1.03; // catch up aggressively (imperceptible 3% speedup)
+        } else if (liveLatency > 12) {
+          v.playbackRate = 1.02; // mild catch-up (2% speedup)
+        } else {
+          v.playbackRate = 1.0; // close enough to live edge, stay normal
+        }
+      }
     }
   }
 
@@ -517,7 +533,7 @@ updateDebugButtonText() {
     // If it's 360p (level 3), use low latency. 
     // If it's 480p (level 2) or higher, use a larger live sync buffer to build a bigger "grey bar" (buffered range)
     const isLowRes = rawUrl.includes('/3/');
-    const liveSyncCount = isLowRes ? 3 : 7; // 3 segments for 360p (~6s latency), 7 segments for 480p+ (~14s buffer zone)
+    const liveSyncCount = isLowRes ? 3 : 5; // 3 segments for 360p (~6s), 5 segments for 480p+ (~10s closer to live)
     const maxBufLength = isLowRes ? 15 : 45; // smaller target for 360p, larger for 480p+
     
     this.log('dynamic sync: ' + liveSyncCount + ' segments delay, max buffer ' + maxBufLength + 's', 'info');
