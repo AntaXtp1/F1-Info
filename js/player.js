@@ -80,7 +80,7 @@ class StreamPlayer {
     if (!navigator.serviceWorker?.controller) return;
     navigator.serviceWorker.controller.postMessage({
       type: 'prefetch-segments',
-      segments: segments.slice(0, 5).map(f => ({ url: f.url, sn: f.sn })),
+      segments: segments.slice(0, 8).map(f => ({ url: f.url, sn: f.sn })), // prefetch up to 8 segments
       proxyUrl: this.PROXY_URL,
       useProxy: this.useProxy
     });
@@ -517,7 +517,7 @@ updateDebugButtonText() {
     // If it's 360p (level 3), use low latency. 
     // If it's 480p (level 2) or higher, use a larger live sync buffer to build a bigger "grey bar" (buffered range)
     const isLowRes = rawUrl.includes('/3/');
-    const liveSyncCount = isLowRes ? 3 : 7; // 3 segments for 360p (~6s latency), 7 segments for 480p+ (~14s buffer zone)
+    const liveSyncCount = isLowRes ? 3 : 10; // 3 segments for 360p (~6s), 10 segments for 480p (~20s safe buffer)
     const maxBufLength = isLowRes ? 15 : 45; // smaller target for 360p, larger for 480p+
     
     this.log('dynamic sync: ' + liveSyncCount + ' segments delay, max buffer ' + maxBufLength + 's', 'info');
@@ -590,10 +590,10 @@ updateDebugButtonText() {
           const frags = data.details?.fragments;
           if (!frags || frags.length === 0) return;
 
-          // Prefetch first 5 via Service Worker
-          this.prefetchViaSW(frags.slice(0, 5));
+          // Prefetch first 8 via Service Worker
+          this.prefetchViaSW(frags.slice(0, 8));
           // Also prefetch via direct fetch as fallback
-          frags.slice(0, 5).forEach(f => {
+          frags.slice(0, 8).forEach(f => {
             if (f.url) this.prefetchSegment(f.url);
           });
           this.log('pre-fetching 5 initial segments', 'debug');
@@ -611,7 +611,7 @@ updateDebugButtonText() {
           if (typeof currentSn !== 'number') return;
 
           const nextFrags = [];
-          for (let i = 1; i <= 4; i++) {
+          for (let i = 1; i <= 8; i++) {
             const nextFrag = frags.find(f => f.sn === currentSn + i);
             if (nextFrag?.url) nextFrags.push(nextFrag);
           }
