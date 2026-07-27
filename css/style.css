@@ -89,9 +89,13 @@ input { font: inherit; color: inherit; }
 
 .servers {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   gap: 14px;
   margin-bottom: 28px;
+}
+
+@media (max-width: 700px) {
+  .servers { grid-template-columns: 1fr; }
 }
 
 .server-btn {

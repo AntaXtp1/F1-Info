@@ -4,18 +4,25 @@
 
 (() => {
   const SERVERS = {
-    turbo: {
-      label: 'TURBO',
-      host: 'master4.cdnid.win',
-      base: 'https://master4.cdnid.win/hls',
+    primary: {
+      label: 'PRIMARY',
+      host: 'master2.hdtvs2.top',
+      base: 'https://master2.hdtvs2.top/hls',
       levels: { 1: '720p', 2: '480p', 3: '360p' },
       defaultLevel: 2
     },
-    ekonomi: {
-      label: 'EKONOMI',
-      host: 'master3.s5stream.top',
-      base: 'https://master3.s5stream.top/hls',
-      levels: { 0: '1080p', 1: '720p', 2: '480p', 3: '360p' },
+    mirror1: {
+      label: 'MIRROR 1',
+      host: 'master2.s1stream.top',
+      base: 'https://master2.s1stream.top/hls',
+      levels: { 2: '480p' },
+      defaultLevel: 2
+    },
+    mirror2: {
+      label: 'MIRROR 2',
+      host: 'master2.sabunhitam.com',
+      base: 'https://master2.sabunhitam.com/hls',
+      levels: { 2: '480p' },
       defaultLevel: 2
     }
   };
@@ -40,29 +47,25 @@
   const $ = (id) => document.getElementById(id);
 
   // ──────────────── Splash probing ────────────────
+  const PROXY = 'https://dryproxy.antarahimmuhammad.workers.dev/?url=';
+
   async function probeServer(key) {
     const cfg = SERVERS[key];
     const url = `${cfg.base}/${state.level}/stream.m3u8`;
     const t0 = performance.now();
+    // Try direct first
     try {
-      const res = await fetch(url, {
-        cache: 'no-store',
-        mode: 'cors',
-        credentials: 'omit',
-        redirect: 'follow'
-      });
+      const res = await fetch(url, { cache: 'no-store', mode: 'cors', credentials: 'omit' });
       const ms = Math.round(performance.now() - t0);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      return { ok: true, ms, url };
+      if (res.ok) return { ok: true, ms, url, viaProxy: false };
+    } catch (_) {}
+    // Fallback: via proxy
+    try {
+      const res = await fetch(PROXY + encodeURIComponent(url), { cache: 'no-store' });
+      const ms = Math.round(performance.now() - t0);
+      if (res.ok) return { ok: true, ms, url, viaProxy: true };
+      throw new Error('HTTP ' + res.status);
     } catch (e) {
-      // Fallback: try no-cors (opaque response = reachable)
-      try {
-        const fallback = await fetch(url, { mode: 'no-cors', cache: 'no-store' });
-        const ms = Math.round(performance.now() - t0);
-        if (fallback.ok || fallback.type === 'opaque') {
-          return { ok: true, ms, url, opaque: true };
-        }
-      } catch (_) {}
       return { ok: false, ms: null, error: String(e.message || e) };
     }
   }
@@ -72,9 +75,9 @@
       Object.keys(SERVERS).map(async (k) => [k, await probeServer(k)])
     );
     for (const [k, result] of probes) {
-      const dot = $('dot' + (k === 'turbo' ? 'Turbo' : 'Ekonomi'));
-      const lat = $('lat' + (k === 'turbo' ? 'Turbo' : 'Ekonomi'));
-      const btn = $(k === 'turbo' ? 'btnTurbo' : 'btnEkonomi');
+      const dot = $('dot' + k);
+      const lat = $('lat' + k);
+      const btn = $('btn' + k);
       if (result.ok) {
         dot.classList.add('live');
         lat.textContent = result.ms + ' ms' + (result.opaque ? ' (cors)' : '');
@@ -95,6 +98,10 @@
     state.server = SERVERS[key];
     state.level = state.server.defaultLevel;
     runLoadingSequence();
+  }
+
+  function resolveUrl(url, useProxy) {
+    return useProxy ? PROXY + encodeURIComponent(url) : url;
   }
 
   // ──────────────── Loading veil sequence ────────────────
@@ -311,8 +318,9 @@
 
   // ──────────────── UI bindings ────────────────
   function bindUI() {
-    $('btnTurbo').addEventListener('click', () => pickServer('turbo'));
-    $('btnEkonomi').addEventListener('click', () => pickServer('ekonomi'));
+    document.querySelectorAll('.server-btn').forEach((b) => {
+      b.addEventListener('click', () => pickServer(b.dataset.server));
+    });
 
     $('btnResToggle').addEventListener('click', (e) => {
       e.stopPropagation();

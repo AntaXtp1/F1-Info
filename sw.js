@@ -9,9 +9,9 @@ const STATIC_ASSETS = ['/', '/index.html', '/css/style.css', '/js/player.js', '/
 
 // All CDN hosts that serve HLS segments
 const SEGMENT_HOSTS = [
-  'master4.cdnid.win',
-  'master3.s5stream.top',
   'master2.hdtvs2.top',
+  'master2.s1stream.top',
+  'master2.sabunhitam.com',
   'dryproxy.antarahimmuhammad.workers.dev'
 ];
 
@@ -50,30 +50,57 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // HLS segments: cache then network
-  if (isSegment(url)) {
-    event.respondWith(
-      caches.open(SEGMENT_CACHE).then(async (cache) => {
-        const hit = await cache.match(event.request);
-        if (hit) {
-          notifyClients({ type: 'cache-hit', url: url.pathname.split('/').pop() });
-          return hit;
-        }
-        const response = await fetch(event.request);
-        if (response.ok) {
-          await cache.put(event.request, response.clone());
-          await pruneCache(cache);
-          notifyClients({ type: 'cache-store', url: url.pathname.split('/').pop() });
-        }
-        return response;
-      })
-    );
+  // HLS segments & manifests: route through SW with custom Referer
+  if (isSegment(url) || url.pathname.endsWith('.m3u8')) {
+    event.respondWith(handleStreamRequest(event.request));
     return;
   }
 
   // Default
   event.respondWith(fetch(event.request).catch(() => caches.match(event.request)));
 });
+
+async function handleStreamRequest(request) {
+  const url = new URL(request.url);
+  const cache = await caches.open(SEGMENT_CACHE);
+  const hit = await cache.match(request);
+  if (hit) {
+    notifyClients({ type: 'cache-hit', url: url.pathname.split('/').pop() });
+    return hit;
+  }
+
+  // Try direct with spoofed Referer — many CDNs 403 without it
+  try {
+    const spoofed = new Request(request, {
+      headers: {
+        ...Object.fromEntries(request.headers.entries()),
+        Referer: 'https://esp32.nontonx.com/',
+        Origin: 'https://esp32.nontonx.com'
+      }
+    });
+    const res = await fetch(spoofed, { mode: 'cors', credentials: 'omit' });
+    if (res.ok) {
+      await cache.put(request, res.clone());
+      await pruneCache(cache);
+      notifyClients({ type: 'cache-store', url: url.pathname.split('/').pop() });
+      return res;
+    }
+  } catch (_) {}
+
+  // Fallback: bare fetch
+  try {
+    const res = await fetch(request);
+    if (res.ok) {
+      await cache.put(request, res.clone());
+      await pruneCache(cache);
+      notifyClients({ type: 'cache-store', url: url.pathname.split('/').pop() });
+      return res;
+    }
+    return new Response('CDN returned ' + res.status, { status: res.status });
+  } catch (e) {
+    return new Response('SW fetch failed: ' + e.message, { status: 502 });
+  }
+}
 
 // Prefetch command from player
 self.addEventListener('message', async (event) => {
