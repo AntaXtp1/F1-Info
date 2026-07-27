@@ -45,11 +45,24 @@
     const url = `${cfg.base}/${state.level}/stream.m3u8`;
     const t0 = performance.now();
     try {
-      const res = await fetch(url, { cache: 'no-store', mode: 'cors' });
+      const res = await fetch(url, {
+        cache: 'no-store',
+        mode: 'cors',
+        credentials: 'omit',
+        redirect: 'follow'
+      });
       const ms = Math.round(performance.now() - t0);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       return { ok: true, ms, url };
     } catch (e) {
+      // Fallback: try no-cors (opaque response = reachable)
+      try {
+        const fallback = await fetch(url, { mode: 'no-cors', cache: 'no-store' });
+        const ms = Math.round(performance.now() - t0);
+        if (fallback.ok || fallback.type === 'opaque') {
+          return { ok: true, ms, url, opaque: true };
+        }
+      } catch (_) {}
       return { ok: false, ms: null, error: String(e.message || e) };
     }
   }
@@ -64,11 +77,11 @@
       const btn = $(k === 'turbo' ? 'btnTurbo' : 'btnEkonomi');
       if (result.ok) {
         dot.classList.add('live');
-        lat.textContent = result.ms + ' ms';
+        lat.textContent = result.ms + ' ms' + (result.opaque ? ' (cors)' : '');
         lat.classList.add('ok');
       } else {
         dot.classList.add('dead');
-        lat.textContent = 'offline';
+        lat.textContent = result.error || 'offline';
         lat.classList.add('bad');
         btn.disabled = true;
       }
