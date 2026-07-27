@@ -1,887 +1,367 @@
-// F1 Stream Player v8 — Silent Browser-Cache Prefetcher
-// Fixed: Zero-risk cache pre-fetching using standard browser cache
+// F1 Live Player v17 — "Silver Drive"
+// Splash server-pick → 5s buffer veil → playback.
+// HLS.js + Service Worker segment cache + dynamic buffer tuning.
 
-class StreamPlayer {
-  constructor() {
-    this.PROXY_URL = 'https://dryproxy.antarahimmuhammad.workers.dev/?url=';
-    this.useProxy = false;
-    this.currentUrl = '';
-    this.hls = null;
-    this.retryCount = 0;
-    this.logTotal = 0;
-    this.fragLoadTimes = [];
-    this.loadingHidden = false;
-    this.stallRecoveryAttempts = 0;
-    this.lastStallTime = 0;
-    this.isRecovering = false;
-    this.videoEventListeners = [];
-    this.bufferWatchdog = null;
-    this.prefetchedUrls = new Set();
-    
-    // Log filtering (all true by default, no individual filter checkboxes)
-    this.logFilters = {
-      info: true,
-      ok: true,
-      warn: true,
-      err: true,
-      debug: true
-    };
+(() => {
+  const SERVERS = {
+    turbo: {
+      label: 'TURBO',
+      host: 'master4.cdnid.win',
+      base: 'https://master4.cdnid.win/hls',
+      levels: { 1: '720p', 2: '480p', 3: '360p' },
+      defaultLevel: 2
+    },
+    ekonomi: {
+      label: 'EKONOMI',
+      host: 'master3.s5stream.top',
+      base: 'https://master3.s5stream.top/hls',
+      levels: { 0: '1080p', 1: '720p', 2: '480p', 3: '360p' },
+      defaultLevel: 2
+    }
+  };
 
-    // DOM cache
-    this.video = document.getElementById('video');
-    this.urlInput = document.getElementById('urlInput');
-    this.statusEl = document.getElementById('status');
-    this.logBox = document.getElementById('logBox');
-    this.logCountEl = document.getElementById('debugToggle'); // re-use for debug toggle counter or simple label
-    this.urlLabel = document.getElementById('urlLabel');
-    this.loadingOverlay = document.getElementById('loadingOverlay');
-    this.loadingBar = document.getElementById('loadingBar');
-    this.loadingText = document.getElementById('loadingText');
-    this.bandwidthMeter = document.getElementById('bandwidthMeter');
-    this.logSide = document.getElementById('logSide');
+  const PRELOAD_BUFFER_S = 7;     // dismiss loading veil after this many seconds ahead
+  const MIN_BUFFER_HARD = 4;       // hard minimum before allowing play
+  const ANIMATION_HOLD_MS = 5000;  // visual loading duration even when buffer ready sooner
 
-    this.init();
+  const state = {
+    serverKey: null,
+    server: null,
+    level: 2,
+    hls: null,
+    video: null,
+    fragTimes: [],
+    swHits: 0,
+    logEntries: [],
+    lastFragSn: 0,
+    playbackRateBase: 1
+  };
+
+  const $ = (id) => document.getElementById(id);
+
+  // ──────────────── Splash probing ────────────────
+  async function probeServer(key) {
+    const cfg = SERVERS[key];
+    const url = `${cfg.base}/${state.level}/stream.m3u8`;
+    const t0 = performance.now();
+    try {
+      const res = await fetch(url, { cache: 'no-store', mode: 'cors' });
+      const ms = Math.round(performance.now() - t0);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return { ok: true, ms, url };
+    } catch (e) {
+      return { ok: false, ms: null, error: String(e.message || e) };
+    }
   }
 
-  init() {
-    this.bindEvents();
-    this.registerServiceWorker();
-    this.log('player ready — starting 480p auto-load...', 'info');
-    
-    // === Opsi 1: Auto-start 480p loading with startup overlay ===
-    this.startupLoad();
+  async function probeAll() {
+    const probes = await Promise.all(
+      Object.keys(SERVERS).map(async (k) => [k, await probeServer(k)])
+    );
+    for (const [k, result] of probes) {
+      const dot = $('dot' + (k === 'turbo' ? 'Turbo' : 'Ekonomi'));
+      const lat = $('lat' + (k === 'turbo' ? 'Turbo' : 'Ekonomi'));
+      const btn = $(k === 'turbo' ? 'btnTurbo' : 'btnEkonomi');
+      if (result.ok) {
+        dot.classList.add('live');
+        lat.textContent = result.ms + ' ms';
+        lat.classList.add('ok');
+      } else {
+        dot.classList.add('dead');
+        lat.textContent = 'offline';
+        lat.classList.add('bad');
+        btn.disabled = true;
+      }
+    }
   }
 
-  registerServiceWorker() {
-    if (!('serviceWorker' in navigator)) {
-      this.log('service worker not supported', 'warn');
+  // ──────────────── Server selection ────────────────
+  function pickServer(key) {
+    if (!SERVERS[key]) return;
+    state.serverKey = key;
+    state.server = SERVERS[key];
+    state.level = state.server.defaultLevel;
+    runLoadingSequence();
+  }
+
+  // ──────────────── Loading veil sequence ────────────────
+  function runLoadingSequence() {
+    const veil = $('loadingVeil');
+    $('splash').style.display = 'none';
+    $('loadName').textContent = state.server.label;
+    $('loadRes').textContent = `${state.server.levels[state.level]} · Membangun buffer...`;
+    $('loadStatus').textContent = 'Menghubungkan ke server...';
+    $('loadFill').style.width = '0%';
+    veil.classList.add('active');
+
+    setStatusText('connecting', 'warn');
+
+    // Start playback immediately
+    startStream();
+
+    // Animate progress
+    const start = Date.now();
+    const tick = setInterval(() => {
+      const elapsed = Date.now() - start;
+      const bufferSec = getBufferedAhead();
+      const target = PRELOAD_BUFFER_S;
+      const ratio = Math.min(1, bufferSec / target);
+      $('loadFill').style.width = (ratio * 100).toFixed(0) + '%';
+
+      if (bufferSec < 1) {
+        $('loadStatus').textContent = 'Meminta playlist...';
+      } else if (bufferSec < 3) {
+        $('loadStatus').textContent = `Buffer ${bufferSec.toFixed(1)}s / ${target}s`;
+      } else if (bufferSec < target) {
+        $('loadStatus').textContent = `Mengamankan buffer ${bufferSec.toFixed(1)}s / ${target}s`;
+      } else {
+        $('loadStatus').textContent = 'Buffer aman · Menyiapkan playback';
+      }
+
+      if (ratio >= 1 || elapsed >= ANIMATION_HOLD_MS) {
+        clearInterval(tick);
+        finishLoading();
+      }
+    }, 200);
+  }
+
+  function finishLoading() {
+    $('loadingVeil').classList.remove('active');
+    $('playerShell').classList.add('active');
+    $('tpServerLabel').textContent = state.server.label + ' · ' + state.server.levels[state.level];
+    syncResMenu();
+    state.video.play().catch((e) => appendLog('autoplay blocked: ' + e.message, 'warn'));
+  }
+
+  // ──────────────── Stream engine ────────────────
+  function startStream() {
+    if (!Hls.isSupported()) {
+      appendLog('HLS not supported', 'err');
       return;
     }
-    navigator.serviceWorker.register('/sw.js')
-      .then(reg => {
-        this.log('service worker registered', 'ok');
-        // Listen for SW messages (cache hits, prefetch logs)
-        navigator.serviceWorker.addEventListener('message', (event) => {
-          const msg = event.data;
-          if (msg?.type === 'sw-prefetch') {
-            this.log('SW cached seg ' + msg.sn + ' (' + msg.url + ')', 'debug');
-          } else if (msg?.type === 'cache-hit') {
-            this.log('SW cache hit: ' + msg.url, 'debug');
-          }
-        });
-      })
-      .catch(err => {
-        this.log('SW registration failed: ' + err.message, 'warn');
-      });
+    cleanupStream();
+
+    const url = `${state.server.base}/${state.level}/stream.m3u8`;
+    state.video = $('video');
+    state.video.muted = true;
+
+    state.hls = new Hls({
+      enableWorker: false,
+      lowLatencyMode: false,
+      maxBufferLength: 60,
+      maxMaxBufferLength: 120,
+      backBufferLength: 30,
+      liveSyncDurationCount: state.level === 3 ? 5 : 10,
+      liveMaxLatencyDurationCount: state.level === 3 ? 12 : 30,
+      liveDurationInfinity: false,
+      maxBufferHole: 0.3,
+      nudgeOffset: 0.05,
+      nudgeMaxRetry: 8,
+      highBufferWatchdogPeriod: 2,
+      manifestLoadingTimeOut: 25000,
+      levelLoadingTimeOut: 25000,
+      fragLoadingTimeOut: 40000,
+      fragLoadingMaxRetry: 10,
+      fragLoadingRetryDelay: 600,
+      levelLoadingMaxRetry: 6,
+      progressive: true,
+      startLevel: 0
+    });
+
+    state.hls.loadSource(url);
+    state.hls.attachMedia(state.video);
+
+    state.hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      appendLog(`manifest parsed (${state.server.label} ${state.server.levels[state.level]})`, 'ok');
+      setStatusText('loading', 'warn');
+      requestSWPrefetch();
+    });
+
+    state.hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
+      const stats = data?.stats;
+      if (stats?.loading?.start && stats?.loading?.end && stats.total) {
+        const dur = stats.loading.end - stats.loading.start;
+        const bps = (stats.total / dur) * 1000;
+        state.fragTimes.push(bps);
+        if (state.fragTimes.length > 8) state.fragTimes.shift();
+        const kbps = Math.round((bps * 8) / 1024);
+        $('tpBw').textContent = `${kbps} Kbps`;
+        state.lastFragSn = data.frag.sn;
+      }
+      requestSWPrefetch();
+    });
+
+    state.hls.on(Hls.Events.ERROR, (_, data) => {
+      appendLog(`[${data.type}] ${data.details}` + (data.fatal ? ' FATAL' : ''), 'err');
+      if (!data.fatal) return;
+      if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        try { state.hls.recoverMediaError(); } catch (e) {}
+      } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        setTimeout(() => state.hls?.startLoad(), 2000);
+      }
+    });
+
+    state.video.addEventListener('playing', () => setStatusText('live', 'ok'));
+    state.video.addEventListener('waiting', () => setStatusText('buffering', 'warn'));
+
+    updateDebugInfo();
   }
 
-  // Tell Service Worker to prefetch upcoming segments
-  prefetchViaSW(segments) {
-    if (!navigator.serviceWorker?.controller) return;
+  function cleanupStream() {
+    if (state.hls) {
+      state.hls.destroy();
+      state.hls = null;
+    }
+  }
+
+  function switchResolution(level) {
+    if (!state.server || level === state.level) return;
+    if (!state.server.levels[level]) return;
+    state.level = level;
+    startStream();
+    syncResMenu();
+    $('tpServerLabel').textContent = state.server.label + ' · ' + state.server.levels[level];
+  }
+
+  function syncResMenu() {
+    document.querySelectorAll('.res-pop button').forEach((b) => {
+      b.classList.toggle('active', Number(b.dataset.level) === state.level);
+    });
+    $('btnResToggle').textContent = state.server.levels[state.level];
+  }
+
+  // ──────────────── SW prefetch bridge ────────────────
+  function requestSWPrefetch() {
+    if (!state.hls || !navigator.serviceWorker?.controller) return;
+    const level = state.hls.levels[state.hls.currentLevel];
+    if (!level?.details) return;
+    const fragments = level.details.fragments || [];
+    const idx = state.lastFragSn;
+    const upcoming = fragments.slice(idx + 1, idx + 9).map((f) => ({ sn: f.sn, url: f.url }));
+    if (!upcoming.length) return;
     navigator.serviceWorker.controller.postMessage({
       type: 'prefetch-segments',
-      segments: segments.slice(0, 8).map(f => ({ url: f.url, sn: f.sn })), // prefetch up to 8 segments
-      proxyUrl: this.PROXY_URL,
-      useProxy: this.useProxy
+      segments: upcoming
     });
   }
 
-  startupLoad() {
-    this.startupOverlay = document.getElementById('startupOverlay');
-    this.startupProgressBar = document.getElementById('startupProgressBar');
-    this.startupStats = document.getElementById('startupStats');
-    this.startupSkipBtn = document.getElementById('startupSkipBtn');
-    this.startupActive = true;
-    this.startupTargetBuffer = 12; // 12s buffer zone (range 10-15s for 480p)
-    this.startupStartTime = Date.now();
-    this.startupMaxTime = 15000; // 15 second hard timeout
-    this.startupLastBuffer = 0; // track last buffer for smooth progress
-
-    // Skip button
-    this.startupSkipBtn.addEventListener('click', () => {
-      this.dismissStartup();
+  function registerSW() {
+    if (!('serviceWorker' in navigator)) return;
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+    navigator.serviceWorker.addEventListener('message', (e) => {
+      const msg = e.data;
+      if (msg?.type === 'cache-hit') {
+        state.swHits++;
+        appendLog('SW cache hit: ' + msg.url, 'debug');
+      } else if (msg?.type === 'cache-store') {
+        appendLog('SW cached: ' + msg.url, 'debug');
+      }
     });
-
-    // Auto-load 480p on startup
-    const url480p = 'https://master2.hdtvs2.top/hls/2/stream.m3u8';
-    document.getElementById('urlInput').value = url480p;
-    this.load(url480p);
-
-    // Monitor buffer progress during startup
-    this.startupMonitor = setInterval(() => {
-      if (!this.startupActive) return;
-      
-      const elapsed = Date.now() - this.startupStartTime;
-      const buffered = this.video.buffered;
-      let bufferedSec = 0;
-      
-      if (buffered.length > 0) {
-        // Find largest buffer chunk ahead of current play position
-        const currentPos = this.video.currentTime;
-        for (let i = 0; i < buffered.length; i++) {
-          const start = buffered.start(i);
-          const end = buffered.end(i);
-          if (currentPos >= start && currentPos <= end) {
-            bufferedSec = end - currentPos;
-            break;
-          }
-        }
-        // Fallback to absolute end if currentPos not in range yet
-        if (bufferedSec === 0) {
-          bufferedSec = buffered.end(buffered.length - 1) - currentPos;
-        }
-      }
-
-      // Smooth progress calculation (always increase, never jump backward)
-      if (bufferedSec > this.startupLastBuffer) {
-        this.startupLastBuffer = bufferedSec;
-      }
-      
-      // Safety calculation for progress percentage
-      const progress = Math.min(100, (this.startupLastBuffer / this.startupTargetBuffer) * 100);
-      this.startupProgressBar.style.width = progress + '%';
-      this.startupStats.textContent = 'buffer: ' + this.startupLastBuffer.toFixed(1) + 's / ' + this.startupTargetBuffer + 's';
-      this.startupProgressBar.style.background = progress >= 100 ? '#4ade80' : '#e63946';
-
-      // Dismiss conditions: buffer target met OR hard timeout
-      if (this.startupLastBuffer >= this.startupTargetBuffer) {
-        this.dismissStartup();
-      } else if (elapsed >= this.startupMaxTime) {
-        this.log('startup timeout — playing with partial buffer', 'warn');
-        this.dismissStartup();
-      }
-    }, 150);
   }
 
-  dismissStartup() {
-    if (!this.startupActive) return;
-    this.startupActive = false;
-    
-    if (this.startupMonitor) {
-      clearInterval(this.startupMonitor);
-      this.startupMonitor = null;
+  // ──────────────── Helpers ────────────────
+  function getBufferedAhead() {
+    const v = state.video;
+    if (!v?.buffered?.length) return 0;
+    for (let i = 0; i < v.buffered.length; i++) {
+      if (v.currentTime >= v.buffered.start(i) && v.currentTime <= v.buffered.end(i)) {
+        return v.buffered.end(i) - v.currentTime;
+      }
     }
-    
-    this.startupOverlay.classList.add('hidden');
-    
-    // Unmute video on user click dismiss/skip
-    this.video.muted = false;
-    
-    // Force play
-    this.video.play().catch(e => {
-      this.log('autoplay blocked after startup: ' + e.message, 'warn');
-      // Show play overlay button if browser still blocks it
-      this.video.muted = true;
-      this.video.play().catch(() => {});
-    });
-    
-    this.setStatus('live', 'ok');
-    this.hideLoading();
-    
-    this.log('startup complete — playing 480p', 'ok');
+    return v.buffered.end(v.buffered.length - 1) - v.currentTime;
   }
 
-  bindEvents() {
-    // PWA Install Event Handler
-    this.deferredInstallPrompt = null;
-    const installBtn = document.getElementById('installAppBtn');
-    
-    window.addEventListener('beforeinstallprompt', (e) => {
-      // Prevent standard mini-infobar from showing
-      e.preventDefault();
-      // Stash the event so it can be triggered later
-      this.deferredInstallPrompt = e;
-      // Show the install button
-      if (installBtn) {
-        installBtn.style.display = 'inline-block';
-        this.log('PWA installation ready to install', 'ok');
-      }
-    });
+  function setStatusText(text, cls) {
+    $('statusTxt').textContent = text;
+    $('tpStatus').className = 'chip live ' + cls;
+  }
 
-    if (installBtn) {
-      installBtn.addEventListener('click', () => {
-        if (!this.deferredInstallPrompt) return;
-        // Show the prompt
-        this.deferredInstallPrompt.prompt();
-        // Wait for the user to respond to the prompt
-        this.deferredInstallPrompt.userChoice.then((choiceResult) => {
-          if (choiceResult.outcome === 'accepted') {
-            this.log('User accepted the PWA install prompt', 'ok');
-          } else {
-            this.log('User dismissed the PWA install prompt', 'info');
-          }
-          this.deferredInstallPrompt = null;
-          installBtn.style.display = 'none';
-        });
+  function appendLog(msg, type = 'info') {
+    const ts = new Date().toLocaleTimeString('id-ID', { hour12: false });
+    state.logEntries.push({ ts, msg, type });
+    if (state.logEntries.length > 50) state.logEntries.shift();
+    const el = $('dbLog');
+    if (el) {
+      const div = document.createElement('div');
+      div.innerHTML = `<span style="color:#5a6370">[${ts}]</span> ${msg}`;
+      el.appendChild(div);
+      el.scrollTop = el.scrollHeight;
+    }
+  }
+
+  function updateDebugInfo() {
+    if (!state.server) return;
+    $('dbServer').textContent = state.server.label;
+    $('dbUrl').textContent = `${state.server.base}/${state.level}/stream.m3u8`;
+    $('dbRes').textContent = state.server.levels[state.level];
+  }
+
+  // ──────────────── UI bindings ────────────────
+  function bindUI() {
+    $('btnTurbo').addEventListener('click', () => pickServer('turbo'));
+    $('btnEkonomi').addEventListener('click', () => pickServer('ekonomi'));
+
+    $('btnResToggle').addEventListener('click', (e) => {
+      e.stopPropagation();
+      $('resPop').classList.toggle('active');
+    });
+    document.querySelectorAll('.res-pop button').forEach((b) => {
+      b.addEventListener('click', () => {
+        $('resPop').classList.remove('active');
+        switchResolution(Number(b.dataset.level));
       });
-    }
+    });
+    document.addEventListener('click', () => $('resPop').classList.remove('active'));
 
-    // Hide install button when app is installed
-    window.addEventListener('appinstalled', () => {
-      this.log('F1 Live installed successfully', 'ok');
-      if (installBtn) installBtn.style.display = 'none';
-      this.deferredInstallPrompt = null;
+    $('btnUnmute').addEventListener('click', () => {
+      const v = $('video');
+      v.muted = !v.muted;
+      $('btnUnmute').textContent = v.muted ? 'Aktifkan Suara' : 'Matikan Suara';
+      $('btnUnmute').classList.toggle('active', !v.muted);
     });
 
-    document.getElementById('loadBtn').addEventListener('click', () => {
-      const url = this.urlInput.value.trim();
-      if (url) this.load(url);
+    $('btnReload').addEventListener('click', () => startStream());
+
+    $('btnFullscreen').addEventListener('click', () => {
+      const v = $('video');
+      if (!document.fullscreenElement) v.requestFullscreen?.();
+      else document.exitFullscreen?.();
     });
 
-    this.urlInput.addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') {
-        const url = this.urlInput.value.trim();
-        if (url) this.load(url);
+    $('btnDebug').addEventListener('click', () => {
+      $('debugDrawer').classList.toggle('active');
+    });
+    $('btnDebugClose').addEventListener('click', () => {
+      $('debugDrawer').classList.remove('active');
+    });
+
+    $('btnBack').addEventListener('click', () => {
+      cleanupStream();
+      $('playerShell').classList.remove('active');
+      $('splash').style.display = 'flex';
+      $('loadingVeil').classList.remove('active');
+      probeAll();
+    });
+
+    // Periodic debug refresh
+    setInterval(() => {
+      if (!state.server || !state.video) return;
+      $('dbBuf').textContent = getBufferedAhead().toFixed(1) + 's';
+      $('dbBw').textContent = $('tpBw').textContent;
+      $('dbRate').textContent = state.video.playbackRate.toFixed(2) + 'x';
+      $('dbFrag').textContent = state.lastFragSn;
+      $('dbSw').textContent = state.swHits;
+      const lat = state.hls?.liveSyncPosition;
+      if (lat != null && state.video) {
+        $('dbLat').textContent = (lat - state.video.currentTime).toFixed(1) + 's';
       }
-    });
+    }, 1000);
+  }
 
-    document.getElementById('proxyToggle').addEventListener('click', (e) => {
-      this.useProxy = !this.useProxy;
-      e.target.classList.toggle('active', this.useProxy);
-      this.log('proxy: ' + (this.useProxy ? 'ON' : 'OFF'), 'warn');
-      if (this.currentUrl) this.load(this.currentUrl);
-    });
-
-    document.getElementById('reloadBtn').addEventListener('click', () => {
-      this.log('manual reload', 'info');
-      if (this.currentUrl) this.load(this.currentUrl);
-    });
-
-    document.getElementById('clearLog').addEventListener('click', () => {
-    this.logBox.innerHTML = '';
-    this.logTotal = 0;
-    this.updateDebugButtonText();
+  // ──────────────── Boot ────────────────
+  document.addEventListener('DOMContentLoaded', () => {
+    bindUI();
+    registerSW();
+    probeAll();
   });
-
-  document.getElementById('debugToggle').addEventListener('click', () => {
-    this.logSide.classList.toggle('visible');
-    // Scroll logs to bottom when opened
-    if (this.logSide.classList.contains('visible')) {
-      this.logBox.scrollTop = this.logBox.scrollHeight;
-    }
-  });
-
-  document.getElementById('closeLogBtn').addEventListener('click', () => {
-    this.logSide.classList.remove('visible');
-  });
-
-  document.getElementById('copyUrl').addEventListener('click', () => {
-    if (!this.currentUrl) return;
-    navigator.clipboard.writeText(this.currentUrl).then(() => {
-      this.log('URL copied to clipboard', 'ok');
-    }).catch(() => {
-      this.log('clipboard copy failed', 'err');
-    });
-  });
-
-  document.querySelectorAll('.preset-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const url = btn.dataset.url;
-      this.urlInput.value = url;
-      this.load(url);
-    });
-  });
-}
-
-applyLogFilters() {
-  // All log filters are true now
-}
-
-log(text, type = 'info') {
-  const now = new Date().toLocaleTimeString('id-ID', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  const div = document.createElement('div');
-  div.className = 'log-line ' + type;
-  div.innerHTML = '<span class="time">[' + now + ']</span>' + this.escapeHtml(text);
-  this.logBox.appendChild(div);
-  this.logBox.scrollTop = this.logBox.scrollHeight;
-  this.logTotal++;
-  this.updateDebugButtonText();
-}
-
-updateDebugButtonText() {
-  const btn = document.getElementById('debugToggle');
-  if (btn) {
-    btn.textContent = 'DEBUG (' + this.logTotal + ')';
-  }
-}
-
-  escapeHtml(t) {
-    return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  }
-
-  setStatus(text, cls) {
-    this.statusEl.textContent = text;
-    this.statusEl.className = 'status ' + (cls || '');
-  }
-
-  showLoading(text) {
-    this.loadingOverlay.classList.add('active');
-    this.loadingText.textContent = text || 'connecting...';
-    this.loadingBar.style.width = '0%';
-    this.loadingHidden = false;
-  }
-
-  hideLoading() {
-    if (this.loadingHidden) return;
-    this.loadingHidden = true;
-    this.loadingOverlay.classList.remove('active');
-  }
-
-  updateLoadingProgress(percent) {
-    this.loadingBar.style.width = percent + '%';
-  }
-
-  buildUrl(rawUrl) {
-    if (!rawUrl) return '';
-    this.urlLabel.textContent = rawUrl;
-    if (this.useProxy && this.PROXY_URL) return this.PROXY_URL + encodeURIComponent(rawUrl);
-    return rawUrl;
-  }
-
-  updateBandwidth(bytesPerSec) {
-    const kbps = (bytesPerSec * 8 / 1024).toFixed(0);
-    this.bandwidthMeter.textContent = kbps + ' Kbps';
-    this.bandwidthMeter.className = 'bandwidth-meter';
-    if (bytesPerSec > 200000) this.bandwidthMeter.classList.add('good');
-    else if (bytesPerSec > 100000) this.bandwidthMeter.classList.add('slow');
-    else this.bandwidthMeter.classList.add('bad');
-  }
-
-  getStatsBytes(stats) {
-    if (!stats) return 0;
-    return stats.total || stats.loaded || 0;
-  }
-
-  getStatsTiming(stats) {
-    if (!stats) return null;
-    if (stats.loading && stats.loading.start && stats.loading.end) {
-      return { start: stats.loading.start, end: stats.loading.end };
-    }
-    if (stats.trequest && stats.tload) {
-      return { start: stats.trequest, end: stats.tload };
-    }
-    return null;
-  }
-
-  checkBufferProgress() {
-    if (this.loadingHidden) return;
-    
-    const buffered = this.video.buffered;
-    if (buffered.length === 0) return;
-    
-    const bufferedEnd = buffered.end(buffered.length - 1);
-    const bufferedSec = bufferedEnd - this.video.currentTime;
-    
-    // Dynamic target buffer: 360p only needs 3s start buffer, 480p+ needs 10s startup buffer
-    const isLowRes = this.currentUrl.includes('/3/');
-    const targetBuffer = isLowRes ? 3 : 10;
-    
-    const progress = Math.min(95, 30 + (bufferedSec / targetBuffer) * 65);
-    
-    if (bufferedSec < 0) {
-      this.loadingText.textContent = 'rebuffering... (buffer empty)';
-      this.updateLoadingProgress(30);
-      this.setStatus('rebuffering', 'warn');
-      return;
-    }
-    
-    this.updateLoadingProgress(progress);
-    this.loadingText.textContent = 'buffering... ' + bufferedSec.toFixed(1) + 's / ' + targetBuffer + 's';
-    
-    if (bufferedSec >= targetBuffer) {
-      this.hideLoading();
-      this.setStatus('live', 'ok');
-      
-      // Dynamic playback rate — slow down to let download catch up
-      this.adjustPlaybackRate(bufferedSec);
-      
-      if (this.video.paused) {
-        this.video.play().catch(e => {
-          this.log('autoplay blocked: ' + e.message, 'warn');
-        });
-      }
-    }
-  }
-  
-  // Imperceptible playback rate adjustment to prevent buffer stalls
-  adjustPlaybackRate(bufferedSec) {
-    const v = this.video;
-    if (!v || v.paused) return;
-    
-    if (bufferedSec < 3) {
-      v.playbackRate = 0.92; // 8% slower — imperceptible but buys time
-    } else if (bufferedSec < 6) {
-      v.playbackRate = 0.95; // 5% slower
-    } else if (bufferedSec < 10) {
-      v.playbackRate = 0.98; // 2% slower
-    } else {
-      v.playbackRate = 1.0;  // normal — buffer is healthy
-    }
-  }
-
-  // === KEY FIX: Stall Recovery ===
-  recoverFromStall() {
-    if (this.isRecovering) return;
-    this.isRecovering = true;
-    this.stallRecoveryAttempts++;
-    
-    const buffered = this.video.buffered;
-    const currentTime = this.video.currentTime;
-    
-    // Find earliest buffered position
-    let bufferStart = Infinity;
-    for (let i = 0; i < buffered.length; i++) {
-      bufferStart = Math.min(bufferStart, buffered.start(i));
-    }
-    
-    this.log('stall recovery #' + this.stallRecoveryAttempts + ' — buffer start: ' + bufferStart.toFixed(1) + 's, current: ' + currentTime.toFixed(1) + 's', 'warn');
-    
-    // Strategy: Seek to buffer start if ahead of current position
-    if (bufferStart < Infinity && bufferStart > currentTime + 0.5) {
-      this.video.currentTime = bufferStart;
-      this.log('seeking to buffer start: ' + bufferStart.toFixed(1), 'info');
-    } else if (this.hls && this.hls.liveSyncPosition) {
-      // Fallback: seek to live edge - 2s (but validate against buffer)
-      const target = this.hls.liveSyncPosition - 2;
-      if (target > 0) {
-        this.video.currentTime = target;
-        this.log('seeking to live edge - 2s: ' + target.toFixed(1), 'info');
-      }
-    }
-    
-    // Force reload
-    if (this.hls) {
-      this.hls.startLoad();
-    }
-    
-    setTimeout(() => {
-      this.isRecovering = false;
-    }, 3000);
-  }
-
-  // Prefetch helper using standard browser fetch (hits memory/disk cache)
-  async prefetchSegment(url) {
-    if (this.prefetchedUrls.has(url)) return;
-    this.prefetchedUrls.add(url);
-
-    // Limit cache history size
-    if (this.prefetchedUrls.size > 20) {
-      const firstVal = this.prefetchedUrls.values().next().value;
-      this.prefetchedUrls.delete(firstVal);
-    }
-
-    try {
-      let fetchUrl = url;
-      if (this.useProxy && this.PROXY_URL) {
-        fetchUrl = this.PROXY_URL + encodeURIComponent(url);
-      }
-
-      // Fetch silently with CORS + cache options
-      await fetch(fetchUrl, {
-        method: 'GET',
-        mode: 'cors',
-        credentials: 'omit',
-        headers: {
-          'Accept': '*/*'
-        }
-      });
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  load(rawUrl) {
-    if (!rawUrl) {
-      this.log('no URL provided', 'err');
-      return;
-    }
-
-    this.currentUrl = rawUrl;
-    const url = this.buildUrl(rawUrl);
-    this.retryCount = 0;
-    this.fragLoadTimes = [];
-    this.stallRecoveryAttempts = 0;
-    this.lastStallTime = 0;
-    this.isRecovering = false;
-    this.prefetchedUrls.clear();
-    
-    this.setStatus('loading', 'loading');
-    this.showLoading('connecting to stream...');
-    this.log('connecting: ' + rawUrl, 'info');
-    if (this.useProxy) this.log('via proxy: ' + this.PROXY_URL.split('?')[0], 'info');
-
-    // Cleanup prior HLS instance
-    this.cleanup();
-
-    // DYNAMIC CONFIG BASED ON RESOLUTION:
-    // If it's 360p (level 3), use low latency. 
-    // If it's 480p (level 2) or higher, use a larger live sync buffer to build a bigger "grey bar" (buffered range)
-    const isLowRes = rawUrl.includes('/3/');
-    const liveSyncCount = isLowRes ? 3 : 10; // 3 segments for 360p (~6s), 10 segments for 480p (~20s safe buffer)
-    const maxBufLength = isLowRes ? 15 : 45; // smaller target for 360p, larger for 480p+
-    
-    this.log('dynamic sync: ' + liveSyncCount + ' segments delay, max buffer ' + maxBufLength + 's', 'info');
-
-    if (Hls.isSupported()) {
-      this.hls = new Hls({
-        enableWorker: false,
-        debug: false,
-        
-        // Live stream config — dynamic based on quality to sustain the "grey bar"
-        liveSyncDurationCount: liveSyncCount,
-        liveMaxLatencyDurationCount: liveSyncCount * 3,
-        maxLiveSyncPlaybackRate: isLowRes ? 1.0 : 0.95, // scale playback speed on high res
-        
-        // Buffer tuning
-        maxBufferLength: maxBufLength,
-        maxMaxBufferLength: maxBufLength * 2,
-        backBufferLength: 0,
-        
-        // Gap handling
-        maxBufferHole: 0.8,
-        highBufferWatchdogPeriod: 2,
-        nudgeMaxRetry: 15,
-        
-        // Network retry
-        manifestLoadingTimeOut: 15000,
-        manifestLoadingMaxRetry: 5,
-        manifestLoadingRetryDelay: 1000,
-        
-        levelLoadingTimeOut: 15000,
-        levelLoadingMaxRetry: 5,
-        levelLoadingRetryDelay: 1000,
-        
-        fragLoadingTimeOut: 30000,
-        fragLoadingMaxRetry: 8,
-        fragLoadingRetryDelay: 1000,
-        fragLoadingMaxRetryTimeout: 64000,
-        
-        // ABR
-        startLevel: 0,
-        capLevelToPlayerSize: false,
-        
-        xhrSetup: (xhr, url) => {
-          xhr.responseType = 'arraybuffer';
-          xhr.overrideMimeType('application/octet-stream');
-        }
-      });
-
-      this.hls.loadSource(url);
-      this.hls.attachMedia(this.video);
-
-      // === MANIFEST ===
-      this.hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
-        this.log('manifest ok — ' + data.levels.length + ' level(s)', 'ok');
-        this.updateLoadingProgress(20);
-        data.levels.forEach((level, idx) => {
-          const res = level.width && level.height ? level.width + 'x' + level.height : 'audio-only';
-          const br = level.bitrate ? (level.bitrate / 1000).toFixed(0) + ' Kbps' : '?';
-          this.log('  level ' + idx + ': ' + res + ' @ ' + br, 'debug');
-        });
-        
-        this.video.play().catch(e => {
-          this.log('autoplay blocked: ' + e.message, 'warn');
-        });
-      });
-
-      // === LEVEL_LOADED (Initial Prefetch Burst) ===
-      this.hls.on(Hls.Events.LEVEL_LOADED, (_, data) => {
-        try {
-          const frags = data.details?.fragments;
-          if (!frags || frags.length === 0) return;
-
-          // Prefetch first 8 via Service Worker
-          this.prefetchViaSW(frags.slice(0, 8));
-          // Also prefetch via direct fetch as fallback
-          frags.slice(0, 8).forEach(f => {
-            if (f.url) this.prefetchSegment(f.url);
-          });
-          this.log('pre-fetching 5 initial segments', 'debug');
-        } catch (e) {}
-      });
-
-      // === FRAG_LOADED (Trigger Prefetch for next 4 segments via SW) ===
-      this.hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
-        try {
-          const details = this.hls?.levels?.[this.hls.currentLevel]?.details;
-          if (!details || !details.fragments) return;
-
-          const frags = details.fragments;
-          const currentSn = data.frag?.sn;
-          if (typeof currentSn !== 'number') return;
-
-          const nextFrags = [];
-          for (let i = 1; i <= 8; i++) {
-            const nextFrag = frags.find(f => f.sn === currentSn + i);
-            if (nextFrag?.url) nextFrags.push(nextFrag);
-          }
-
-          // Send to SW for parallel prefetch
-          this.prefetchViaSW(nextFrags);
-          
-          // Also direct fetch as fallback
-          nextFrags.forEach(f => this.prefetchSegment(f.url));
-
-          if (nextFrags.length > 0) {
-            this.log('pre-fetched ' + nextFrags.length + ' segments ahead of seg ' + currentSn, 'debug');
-          }
-        } catch (e) {
-          this.log('prefetch error: ' + e.message, 'debug');
-        }
-      });
-
-      // === LEVEL LOADED ===
-      let levelLoadCount = 0;
-      this.hls.on(Hls.Events.LEVEL_LOADED, (_, data) => {
-        levelLoadCount++;
-        if (levelLoadCount <= 2 || levelLoadCount % 10 === 0) {
-          const frags = data.details.fragments?.length || '?';
-          this.log('playlist refresh #' + levelLoadCount + ' — ' + frags + ' frags', 'debug');
-        }
-      });
-
-      // === FRAG LOADED ===
-      let fragLoadCount = 0;
-      this.hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
-        try {
-          const frag = data.frag;
-          const stats = data.stats;
-          fragLoadCount++;
-
-          const bytes = this.getStatsBytes(stats);
-          const timing = this.getStatsTiming(stats);
-          const size = bytes ? (bytes / 1024).toFixed(1) + 'KB' : '?';
-          
-          let speed = '?';
-          let downloadMs = 0;
-          let fragDurMs = (frag.duration || 0) * 1000;
-          
-          if (timing) {
-            downloadMs = timing.end - timing.start;
-            if (downloadMs > 0 && bytes > 0) {
-              const bytesPerSec = (bytes / downloadMs) * 1000;
-              speed = (bytesPerSec / 1024).toFixed(1) + ' KB/s';
-              this.updateBandwidth(bytesPerSec);
-            }
-          }
-          
-          const ratio = fragDurMs > 0 && downloadMs > 0 ? (downloadMs / fragDurMs).toFixed(2) : '?';
-          
-          const isSlow = downloadMs > fragDurMs * 1.5;
-          if (fragLoadCount === 1 || fragLoadCount % 5 === 0 || isSlow) {
-            let msg = 'frag ' + frag.sn + ' — ' + size + ' @ ' + speed + ' (ratio ' + ratio + ')';
-            this.log(msg, isSlow ? 'warn' : 'info');
-          }
-
-          this.checkBufferProgress();
-        } catch (e) {
-          this.log('FRAG_LOADED handler error: ' + e.message, 'err');
-        }
-      });
-
-      // === BUFFER_APPENDED ===
-      let bufferAppendCount = 0;
-      this.hls.on(Hls.Events.BUFFER_APPENDED, (_, data) => {
-        bufferAppendCount++;
-        const b = this.video.buffered;
-        if (b.length > 0) {
-          const bufferedSec = (b.end(b.length - 1) - this.video.currentTime).toFixed(1);
-          if (bufferAppendCount === 1 || bufferAppendCount % 3 === 0) {
-            this.log('buffer append #' + bufferAppendCount + ' — ' + bufferedSec + 's ahead', 'info');
-          }
-        }
-        this.checkBufferProgress();
-      });
-
-      // === FRAG_BUFFERED ===
-      this.hls.on(Hls.Events.FRAG_BUFFERED, (_, data) => {
-        const b = this.video.buffered;
-        if (b.length > 0) {
-          const bufferedSec = (b.end(b.length - 1) - this.video.currentTime).toFixed(1);
-          this.log('buffer: ' + bufferedSec + 's ahead @ pos ' + this.video.currentTime.toFixed(1), 'debug');
-        }
-        this.checkBufferProgress();
-      });
-
-      // === === === === === === === === === === === === === ===
-      // === FIXED: Comprehensive Error Handling ===
-      // === === === === === === === === === === === === === ===
-      this.hls.on(Hls.Events.ERROR, (_, data) => {
-        const msg = '[' + data.type + '] ' + data.details;
-        
-        // Log semua error tapi bedain severity
-        if (data.fatal) {
-          this.log(msg, 'err');
-        } else if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR) {
-          this.log(msg, 'warn');
-        } else {
-          this.log(msg, 'info');
-        }
-        
-        if (data.response) this.log('HTTP ' + data.response.code, 'err');
-        if (data.reason) this.log('reason: ' + data.reason, 'err');
-
-        // === BUFFER STALLED (let hls.js handle via nudge) ===
-        if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR) {
-          this.log('buffer stalled — hls.js will attempt nudge', 'info');
-          return;
-        }
-
-        // === BUFFER NUDGE (gap handling) ===
-        if (data.details === Hls.ErrorDetails.BUFFER_NUDGE_ON_STALL) {
-          this.log('nudging playback to overcome gap', 'info');
-          return;
-        }
-
-        if (data.fatal) {
-          this.hideLoading();
-          this.setStatus('fatal', 'err');
-          
-          switch (data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              this.retryCount++;
-              if (this.retryCount > 5) {
-                this.log('retry limit reached', 'err');
-                this.setStatus('failed', 'err');
-              } else {
-                this.log('network error — retry #' + this.retryCount + ' in 3s', 'warn');
-                setTimeout(() => {
-                  if (this.hls) this.hls.startLoad();
-                }, 3000);
-              }
-              break;
-              
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              this.log('media error — attempting recovery...', 'warn');
-              try {
-                this.hls.recoverMediaError();
-              } catch (e) {
-                this.log('media recovery failed, trying swap...', 'err');
-                try {
-                  this.hls.swapAudioCodec();
-                  this.hls.recoverMediaError();
-                } catch (e2) {
-                  this.log('unrecoverable media error', 'err');
-                  this.setStatus('failed', 'err');
-                }
-              }
-              break;
-              
-            default:
-              this.log('unrecoverable error: ' + data.type, 'err');
-              this.setStatus('failed', 'err');
-          }
-        }
-      });
-
-      // === VIDEO ELEMENT EVENTS (tracked for cleanup) ===
-      const onWaiting = () => {
-        const pos = this.video.currentTime.toFixed(1);
-        this.log('WAITING @ ' + pos, 'warn');
-        
-        if (this.loadingHidden) {
-          this.loadingHidden = false;
-          this.loadingOverlay.classList.add('active');
-          this.loadingText.textContent = 'rebuffering...';
-          this.setStatus('rebuffering', 'warn');
-        }
-        
-        const buffered = this.video.buffered;
-        let hasBuffer = false;
-        for (let i = 0; i < buffered.length; i++) {
-          if (this.video.currentTime >= buffered.start(i) && this.video.currentTime <= buffered.end(i)) {
-            hasBuffer = true;
-            break;
-          }
-        }
-        
-        // Manual stall recovery disabled — let hls.js handle it
-        // if (!hasBuffer && !this.isRecovering) {
-        //   this.recoverFromStall();
-        // }
-      };
-
-      const onStalled = () => {
-        this.log('STALLED — network interrupted', 'warn');
-      };
-
-      const onPlaying = () => {
-        this.log('playback resumed', 'ok');
-        this.setStatus('live', 'ok');
-        this.hideLoading();
-        this.stallRecoveryAttempts = 0;
-        
-        // Reset playback rate when playing starts/resumes
-        const buffered = this.video.buffered;
-        if (buffered.length > 0) {
-          const bufferedSec = buffered.end(buffered.length - 1) - this.video.currentTime;
-          this.adjustPlaybackRate(bufferedSec);
-        }
-      };
-
-      const onError = () => {
-        const err = this.video.error;
-        if (err) {
-          const codes = ['', 'ABORTED', 'NETWORK', 'DECODE', 'SRC_NOT_SUPPORTED'];
-          this.log('video element error: ' + (codes[err.code] || 'UNKNOWN') + ' (' + err.code + ')', 'err');
-        }
-      };
-
-      this.video.addEventListener('waiting', onWaiting);
-      this.video.addEventListener('stalled', onStalled);
-      this.video.addEventListener('playing', onPlaying);
-      this.video.addEventListener('error', onError);
-      
-      this.videoEventListeners.push(['waiting', onWaiting], ['stalled', onStalled], ['playing', onPlaying], ['error', onError]);
-      
-      // === PERIODIC BUFFER CHECK (disabled — let hls.js handle stalls) ===
-      // Watchdog disabled — HLS.js built-in stall detection + nudge is more reliable
-      // this.bufferWatchdog = setInterval(() => { ... }, 5000);
-
-    } else if (this.video.canPlayType('application/vnd.apple.mpegurl')) {
-      this.log('native HLS (Safari/iOS)', 'info');
-      this.video.src = url;
-      this.video.addEventListener('loadedmetadata', () => {
-        this.hideLoading();
-        this.video.play();
-        this.setStatus('live', 'ok');
-        this.log('native stream OK', 'ok');
-      }, { once: true });
-      this.video.addEventListener('error', () => {
-        this.hideLoading();
-        this.setStatus('error', 'err');
-      }, { once: true });
-      
-    } else {
-      this.hideLoading();
-      this.log('HLS not supported', 'err');
-      this.setStatus('unsupported', 'err');
-    }
-  }
-  
-  cleanup() {
-    if (this.bufferWatchdog) {
-      clearInterval(this.bufferWatchdog);
-      this.bufferWatchdog = null;
-    }
-    if (this.hls) {
-      this.hls.destroy();
-      this.hls = null;
-    }
-    this.videoEventListeners.forEach(([event, handler]) => {
-      this.video.removeEventListener(event, handler);
-    });
-    this.videoEventListeners = [];
-  }
-  
-  destroy() {
-    this.cleanup();
-  }
-}
-
-// Init
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => { window.player = new StreamPlayer(); });
-} else {
-  window.player = new StreamPlayer();
-}
+})();
